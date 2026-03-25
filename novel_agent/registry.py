@@ -38,4 +38,18 @@ def build_default_registry() -> ToolRegistry:
             required_args=("raw_text",),
         )
     )
+    registry.register(
+        ToolSpec(
+            name="memory_search",
+            description="Search long-term and daily memory files for relevant novel context.",
+            required_args=("query",),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="memory_get",
+            description="Fetch a specific memory document, such as long_term or a daily memory file.",
+            required_args=("target",),
+        )
+    )
     return registry

@@ -11,13 +11,17 @@ from novel_agent.workspace import WorkspaceManager
 
 
 class StubDecisionBackend:
-    def __init__(self, decision: DecisionOutput) -> None:
-        self.decision = decision
+    def __init__(self, decisions) -> None:
+        if isinstance(decisions, list):
+            self.decisions = list(decisions)
+        else:
+            self.decisions = [decisions]
         self.calls = 0
 
-    def decide(self, messages, workspace_docs, session_summary):
+    def decide(self, messages, workspace_docs, session_summary, loop_events=None):
         self.calls += 1
-        return self.decision
+        index = min(self.calls - 1, len(self.decisions) - 1)
+        return self.decisions[index]
 
 
 class StubCompressionBackend:
@@ -29,11 +33,12 @@ class StubCompressionBackend:
         return CompressionResult(compressed_text="压缩结果", thinking="调试思考")
 
 
-def build_controller(tmp_path: Path, decision: DecisionOutput):
+def build_controller(tmp_path: Path, decisions):
     config = AgentConfig(
         workspace_root=tmp_path / "workspace",
         session_root=tmp_path / "sessions",
         show_debug_thinking=True,
+        agent_max_loop_steps=4,
     )
     workspace = WorkspaceManager(config)
     workspace.bootstrap()
@@ -41,7 +46,7 @@ def build_controller(tmp_path: Path, decision: DecisionOutput):
         config=config,
         workspace=workspace,
         registry=build_default_registry(),
-        decision_backend=StubDecisionBackend(decision),
+        decision_backend=StubDecisionBackend(decisions),
         compression_backend=StubCompressionBackend(),
     )
     return NovelAgentController(deps), deps
@@ -109,6 +114,7 @@ def test_compress_tool_runs_and_returns_tool_output(tmp_path: Path):
     assert result.action == "call_tool"
     assert deps.compression_backend.last_request is not None
     assert deps.compression_backend.last_request.raw_text == "这是一章小说原文"
+    assert deps.compression_backend.last_request.seed is None
 
 
 def test_force_compress_bypasses_decision_backend_and_extracts_raw_text(tmp_path: Path):
@@ -128,3 +134,36 @@ def test_force_compress_bypasses_decision_backend_and_extracts_raw_text(tmp_path
     assert deps.decision_backend.calls == 0
     assert deps.compression_backend.last_request is not None
     assert deps.compression_backend.last_request.raw_text == "第一章，林秋推开门，发现沈砚已经坐在窗边等她。"
+
+
+def test_memory_search_can_happen_before_final_reply(tmp_path: Path):
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            action="call_tool",
+            tool_name="memory_search",
+            tool_args={"query": "人物关系"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="你之前偏好保留人物关系。",
+        ),
+    ]
+    controller, deps = build_controller(tmp_path, decisions)
+    deps.workspace.append_long_term_entries(["用户偏好压缩时保留人物关系"])
+    session = SessionState()
+    result = controller.handle_user_message(session, "我之前说过什么压缩偏好吗？")
+    assert result.reply == "你之前偏好保留人物关系。"
+    assert result.action == "call_tool"
+    assert len(result.tool_trace["steps"]) == 1
+    assert result.tool_trace["steps"][0]["requested_tool"] == "memory_search"
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert event_types == [
+        "user_message",
+        "agent_decision",
+        "tool_call",
+        "tool_result",
+        "agent_decision",
+        "assistant_message",
+    ]

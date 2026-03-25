@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -82,16 +83,114 @@ class LocalCompressionBackend(BaseBackend):
             )
         model_inputs = self._tokenizer([prompt], return_tensors="pt").to(_model_device(self._model, self._torch))
         seed = resolve_seed(request.seed)
-        with self._torch.random.fork_rng():
-            self._torch.manual_seed(seed)
-            generated_ids = self._model.generate(
-                **model_inputs,
-                max_new_tokens=request.max_new_tokens,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                do_sample=bool(request.temperature > 0),
-            )
+        generation_kwargs = {
+            "max_new_tokens": request.max_new_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "do_sample": bool(request.temperature > 0),
+        }
+        generated_ids = _generate_with_sampling_seed(
+            self._torch,
+            self._model,
+            model_inputs,
+            generation_kwargs,
+            seed,
+        )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
         thinking, answer = split_think_and_answer(self._tokenizer, output_ids)
         return CompressionResult(compressed_text=answer, thinking=thinking)
+
+
+def _build_generator(torch_module: Any, model: Any, seed: int):
+    device = _model_device(model, torch_module)
+    for candidate in (device, str(device)):
+        try:
+            generator = torch_module.Generator(device=candidate)
+            generator.manual_seed(seed)
+            return generator
+        except Exception:
+            continue
+
+    generator = torch_module.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def _generate_with_sampling_seed(
+    torch_module: Any,
+    model: Any,
+    model_inputs: Any,
+    generation_kwargs: dict[str, Any],
+    seed: int,
+):
+    if not generation_kwargs.get("do_sample"):
+        return model.generate(**model_inputs, **generation_kwargs)
+
+    generator_kwargs = dict(generation_kwargs)
+    generator_kwargs["generator"] = _build_generator(torch_module, model, seed)
+    try:
+        return model.generate(**model_inputs, **generator_kwargs)
+    except (TypeError, ValueError) as exc:
+        if not _is_unsupported_generator_error(exc):
+            raise
+
+    fallback_kwargs = dict(generation_kwargs)
+    with _seeded_generation_context(torch_module, model, seed):
+        return model.generate(**model_inputs, **fallback_kwargs)
+
+
+def _is_unsupported_generator_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "generator" in message and "model_kwargs" in message and "not used by the model" in message
+
+
+@contextmanager
+def _seeded_generation_context(torch_module: Any, model: Any, seed: int):
+    random_module = getattr(torch_module, "random", None)
+    fork_rng = getattr(random_module, "fork_rng", None)
+    if callable(fork_rng):
+        with fork_rng(devices=_model_cuda_devices(torch_module, model)):
+            torch_module.manual_seed(seed)
+            yield
+        return
+
+    torch_module.manual_seed(seed)
+    yield
+
+
+def _model_cuda_devices(torch_module: Any, model: Any) -> list[int]:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    devices: list[int] = []
+    if isinstance(hf_device_map, dict):
+        for value in hf_device_map.values():
+            index = _parse_cuda_device_index(value)
+            if index is not None:
+                devices.append(index)
+    if devices:
+        return sorted(set(devices))
+
+    index = _parse_cuda_device_index(_model_device(model, torch_module))
+    if index is not None:
+        return [index]
+    return []
+
+
+def _parse_cuda_device_index(device: Any) -> int | None:
+    if isinstance(device, int):
+        return device if device >= 0 else None
+
+    device_type = getattr(device, "type", None)
+    if device_type == "cuda":
+        index = getattr(device, "index", None)
+        return 0 if index is None else index
+
+    text = str(device)
+    if text == "cuda":
+        return 0
+    if text.startswith("cuda:"):
+        try:
+            return int(text.split(":", 1)[1])
+        except ValueError:
+            return None
+    return None

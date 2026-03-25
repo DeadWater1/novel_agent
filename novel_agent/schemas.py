@@ -24,7 +24,7 @@ class CompressionRequest(BaseModel):
     raw_text: str
     max_new_tokens: int = 2800
     temperature: float = 0.2
-    seed: int = 42
+    seed: int | None = None
     top_p: float = 0.95
     top_k: int = 20
     enable_thinking: bool = True
@@ -49,3 +49,4 @@ class AgentTurnResult(BaseModel):
     tool_trace: dict[str, Any] = Field(default_factory=dict)
     thinking: str = ""
     memory_preview: dict[str, list[str]] = Field(default_factory=lambda: {"daily": [], "long_term": []})
+    transcript_events: list[dict[str, Any]] = Field(default_factory=list)

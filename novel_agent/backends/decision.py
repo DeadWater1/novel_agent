@@ -128,7 +128,13 @@ class LocalDecisionBackend(BaseBackend):
         if load_model:
             self._model = _load_model_with_runtime(AutoModelForCausalLM, self.model_path, torch)
 
-    def decide(self, messages: list[dict[str, str]], workspace_docs: str, session_summary: str) -> DecisionOutput:
+    def decide(
+        self,
+        messages: list[dict[str, str]],
+        workspace_docs: str,
+        session_summary: str,
+        loop_events: list[dict[str, Any]] | None = None,
+    ) -> DecisionOutput:
         self._ensure_loaded(load_model=True)
         assert self._tokenizer is not None
         assert self._model is not None
@@ -142,7 +148,8 @@ class LocalDecisionBackend(BaseBackend):
                 "content": (
                     "请根据以下对话和会话摘要输出决策 JSON。\n\n"
                     f"Session Summary:\n{session_summary or '(empty)'}\n\n"
-                    f"Messages:\n{json.dumps(messages, ensure_ascii=False)}"
+                    f"Messages:\n{json.dumps(messages, ensure_ascii=False)}\n\n"
+                    f"Loop Events:\n{json.dumps(loop_events or [], ensure_ascii=False)}"
                 ),
             },
         ]
