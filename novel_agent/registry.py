@@ -41,14 +41,14 @@ def build_default_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="memory_search",
-            description="Search long-term and daily memory files for relevant novel context.",
+            description="Search current-session, history-session, or time-window memory and return ranked evidence or recap targets.",
             required_args=("query",),
         )
     )
     registry.register(
         ToolSpec(
             name="memory_get",
-            description="Fetch a specific memory document, such as long_term or a daily memory file.",
+            description="Fetch a memory target returned by memory_search or recent content references, optionally delivering full text immediately.",
             required_args=("target",),
         )
     )

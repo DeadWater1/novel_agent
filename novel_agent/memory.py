@@ -170,9 +170,13 @@ class SessionStore:
                     "action": "direct_reply",
                     "decision": {},
                     "tool_trace": {},
+                    "timestamp": "",
                 },
             )
             event_type = str(payload.get("event_type", ""))
+            timestamp = str(payload.get("timestamp", "")).strip()
+            if timestamp:
+                current["timestamp"] = timestamp
             if event_type == "user_message":
                 current["user_message"] = str(payload.get("content", "")).strip()
             elif event_type == "assistant_message":
@@ -205,6 +209,26 @@ class SessionStore:
         if not files:
             return None
         return self.load_session(files[0].stem)
+
+    def list_session_infos(self) -> list[dict[str, Any]]:
+        self.bootstrap()
+        index = self._load_index()
+        if index:
+            return sorted(index.values(), key=lambda item: item.get("updated_at", ""), reverse=True)
+
+        files = sorted(self.root.glob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+        results: list[dict[str, Any]] = []
+        for path in files:
+            results.append(
+                {
+                    "session_id": path.stem,
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+                    "event_count": 0,
+                    "last_turn_index": 0,
+                    "last_event_type": "",
+                }
+            )
+        return results
 
     def _load_index(self) -> dict[str, dict[str, Any]]:
         self.bootstrap()

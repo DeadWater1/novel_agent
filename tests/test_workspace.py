@@ -32,7 +32,12 @@ def test_memory_search_and_memory_get_are_available(tmp_path: Path):
     results = workspace.memory_search("人物关系", max_results=3)
     assert results
     assert results[0]["source_id"] == "long_term"
+    assert str(results[0]["target"]).startswith("long_term#L")
 
     latest_daily = workspace.memory_get("daily_latest")
     assert latest_daily["target"] == "daily_latest"
     assert "今天讨论了剧情推进" in latest_daily["content"]
+
+    ranged = workspace.memory_get(str(results[0]["target"]))
+    assert ranged["resolved_target"].startswith("long_term#L")
+    assert "人物关系" in ranged["content"]

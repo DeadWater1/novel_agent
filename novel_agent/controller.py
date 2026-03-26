@@ -1,57 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
+import re
 from typing import Any
 
 from pydantic import ValidationError
 
+from .compaction import ContextCompactionManager, render_compact_summary_text
 from .config import AgentConfig
-from .memory import SessionState
+from .context_engine import ContextEngine, ContextEngineDependencies
+from .memory import SessionState, SessionStore
 from .registry import ToolRegistry
-from .schemas import AgentTurnResult, CompressionRequest, DecisionOutput, MemoryWrite
+from .schemas import (
+    AgentTurnResult,
+    CompressionRequest,
+    ContextReport,
+    DecisionOutput,
+    DecisionReviewOutput,
+    MemoryGetArgs,
+    MemorySearchArgs,
+    MemoryWrite,
+    RecentContentReference,
+    TimeScope,
+)
+from .search_utils import extract_snippet, hybrid_search_score, mmr_rerank
+from .session_meta import SessionMetaStore
 from .workspace import WorkspaceManager
 
 
-COMPRESSION_KEYWORDS = (
-    "压缩",
-    "压一下",
-    "压一压",
-    "帮我压",
-    "精简",
-    "浓缩",
-    "缩写",
-    "缩短",
-    "提炼",
-    "精炼",
-)
-
-NOVEL_COMPRESSION_TARGET_KEYWORDS = (
-    "小说",
-    "章节",
-    "这章",
-    "这一章",
-    "一章",
-    "原文",
-    "正文",
-    "剧情",
-    "人物",
-    "设定",
-    "世界观",
-    "片段",
-    "文段",
-)
-
-CODE_LIKE_KEYWORDS = (
-    "python",
-    "java",
-    "javascript",
-    "代码",
-    "函数",
-    "class ",
-    "def ",
-    "import ",
-    "```",
-)
+SESSION_SEARCH_CANDIDATE_MULTIPLIER = 4
 
 
 @dataclass(slots=True)
@@ -61,6 +39,9 @@ class ControllerDependencies:
     registry: ToolRegistry
     decision_backend: Any
     compression_backend: Any
+    session_store: SessionStore | None = None
+    meta_store: SessionMetaStore | None = None
+    compaction_manager: ContextCompactionManager | None = None
 
 
 @dataclass(slots=True)
@@ -77,54 +58,60 @@ class ToolExecutionResult:
 class NovelAgentController:
     def __init__(self, deps: ControllerDependencies) -> None:
         self.deps = deps
+        self.context_engine = ContextEngine(
+            ContextEngineDependencies(
+                config=deps.config,
+                workspace=deps.workspace,
+                decision_backend=deps.decision_backend,
+                session_store=deps.session_store,
+                meta_store=deps.meta_store,
+                compaction_manager=deps.compaction_manager,
+                search_memory_fn=self._search_memory_sources,
+            )
+        )
 
     def handle_user_message(self, session: SessionState, user_text: str) -> AgentTurnResult:
         session.add_user_message(user_text)
+        session.refresh_summary(self.deps.config.session_summary_max_chars)
         turn_index = (len(session.messages) + 1) // 2
         transcript_events = [self._event(turn_index, "user_message", role="user", content=user_text)]
         loop_events: list[dict[str, Any]] = []
         aggregated_memory = MemoryWrite()
         tool_steps: list[dict[str, Any]] = []
         used_tool = False
-
-        forced_decision = self._build_forced_compress_decision(user_text)
-        if forced_decision is not None:
-            transcript_events.append(self._decision_event(turn_index, 1, forced_decision))
-            self._merge_memory_write(aggregated_memory, forced_decision.memory_write)
-            result = self._handle_tool_step(
-                session=session,
-                turn_index=turn_index,
-                step_index=1,
-                decision=forced_decision,
-                transcript_events=transcript_events,
-                tool_steps=tool_steps,
-                aggregated_memory=aggregated_memory,
-            )
-            if result is not None:
-                return result
+        review_passes = 0
+        context_report = ContextReport()
 
         for step_index in range(1, self.deps.config.agent_max_loop_steps + 1):
-            docs_bundle = self.deps.workspace.load_workspace_docs(session.summary)
-            recent_messages = session.recent_messages(self.deps.config.recent_message_limit)
+            context_bundle = self.context_engine.build_turn_context(
+                session=session,
+                user_text=user_text,
+                loop_events=loop_events,
+            )
+            context_report = self._merge_context_report(context_report, context_bundle.context_report)
 
             try:
                 decision = self.deps.decision_backend.decide(
-                    messages=recent_messages,
-                    workspace_docs=docs_bundle,
-                    session_summary=session.summary,
-                    loop_events=loop_events,
+                    messages=context_bundle.messages,
+                    workspace_docs=context_bundle.workspace_docs,
+                    session_summary=context_bundle.session_summary,
+                    compacted_session_context=context_bundle.compacted_session_context,
+                    recent_content_references=context_bundle.recent_content_references,
+                    loop_events=context_bundle.loop_events,
                 )
             except ValidationError as exc:
                 return self._finalize_error(
                     session,
                     f"决策结果校验失败: {exc}",
                     transcript_events=transcript_events,
+                    context_report=context_report,
                 )
             except Exception as exc:
                 return self._finalize_error(
                     session,
                     f"决策后端不可用: {exc}",
                     transcript_events=transcript_events,
+                    context_report=context_report,
                 )
 
             if not isinstance(decision, DecisionOutput):
@@ -135,6 +122,7 @@ class NovelAgentController:
                         session,
                         f"决策结果校验失败: {exc}",
                         transcript_events=transcript_events,
+                        context_report=context_report,
                     )
 
             transcript_events.append(self._decision_event(turn_index, step_index, decision))
@@ -150,9 +138,38 @@ class NovelAgentController:
                     transcript_events=transcript_events,
                     memory_write=aggregated_memory,
                     tool_trace={"steps": tool_steps},
+                    context_report=context_report,
                 )
 
             if decision.action == "direct_reply":
+                if self._should_review_direct_reply(used_tool=used_tool, review_passes=review_passes):
+                    review = self._review_direct_reply(
+                        user_text=user_text,
+                        decision=decision,
+                        context_bundle=context_bundle,
+                    )
+                    context_report.review_triggered = True
+                    context_report.review_verdict = review.verdict
+                    context_report.review_reason = review.reason
+                    transcript_events.append(
+                        self._event(
+                            turn_index,
+                            "decision_review",
+                            step_index=step_index,
+                            payload=review.model_dump(),
+                        )
+                    )
+                    if review.verdict == "retry":
+                        review_passes += 1
+                        loop_events.append(
+                            {
+                                "step_index": step_index,
+                                "event_type": "decision_review",
+                                "verdict": review.verdict,
+                                "reason": review.reason,
+                            }
+                        )
+                        continue
                 reply = decision.assistant_reply.strip() or "当前请求暂时无法处理"
                 final_action = "call_tool" if used_tool else "direct_reply"
                 return self._finalize_success(
@@ -164,6 +181,7 @@ class NovelAgentController:
                     transcript_events=transcript_events,
                     memory_write=aggregated_memory,
                     tool_trace={"steps": tool_steps},
+                    context_report=context_report,
                 )
 
             if decision.action == "reject":
@@ -176,6 +194,7 @@ class NovelAgentController:
                     transcript_events=transcript_events,
                     memory_write=aggregated_memory,
                     tool_trace={"steps": tool_steps},
+                    context_report=context_report,
                 )
 
             if decision.action != "call_tool":
@@ -185,6 +204,7 @@ class NovelAgentController:
                     decision=decision.model_dump(),
                     transcript_events=transcript_events,
                     tool_trace={"steps": tool_steps},
+                    context_report=context_report,
                 )
 
             result = self._handle_tool_step(
@@ -195,6 +215,7 @@ class NovelAgentController:
                 transcript_events=transcript_events,
                 tool_steps=tool_steps,
                 aggregated_memory=aggregated_memory,
+                context_report=context_report,
             )
             if result is not None:
                 return result
@@ -223,6 +244,7 @@ class NovelAgentController:
             "当前请求暂时无法处理",
             transcript_events=transcript_events,
             tool_trace={"steps": tool_steps, "status": "loop_exhausted"},
+            context_report=context_report,
         )
 
     def _handle_tool_step(
@@ -235,6 +257,7 @@ class NovelAgentController:
         transcript_events: list[dict[str, Any]],
         tool_steps: list[dict[str, Any]],
         aggregated_memory: MemoryWrite,
+        context_report: ContextReport,
     ) -> AgentTurnResult | None:
         tool_name = decision.tool_name
         if not self.deps.registry.is_registered(tool_name):
@@ -274,7 +297,7 @@ class NovelAgentController:
         )
 
         try:
-            execution = self._execute_tool(tool_name, dict(decision.tool_args))
+            execution = self._execute_tool(session, tool_name, dict(decision.tool_args))
         except Exception as exc:
             return self._finalize_error(
                 session,
@@ -315,10 +338,11 @@ class NovelAgentController:
                 tool_trace={"steps": tool_steps, "final_tool": execution.tool_name},
                 thinking=execution.thinking,
                 memory_write=aggregated_memory,
+                context_report=context_report,
             )
         return None
 
-    def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> ToolExecutionResult:
+    def _execute_tool(self, session: SessionState, tool_name: str, tool_args: dict[str, Any]) -> ToolExecutionResult:
         if tool_name == "compress_chapter":
             seed_value = tool_args.get("seed", self.deps.config.compression_seed)
             request = CompressionRequest(
@@ -342,89 +366,762 @@ class NovelAgentController:
             )
 
         if tool_name == "memory_search":
-            query = str(tool_args["query"]).strip()
-            max_results = int(tool_args.get("max_results", self.deps.config.memory_search_max_results))
-            results = self.deps.workspace.memory_search(query=query, max_results=max_results)
+            search_args = MemorySearchArgs.model_validate(tool_args)
+            max_results = int(search_args.max_results or self.deps.config.memory_search_max_results)
+            results = self._search_memory_sources(
+                session=session,
+                query=search_args.query.strip(),
+                max_results=max_results,
+                search_mode=search_args.search_mode,
+                scope=search_args.scope,
+                time_scope=search_args.time_scope,
+            )
             if results:
-                lines = [f"{idx}. {item['source_id']}: {item['snippet']}" for idx, item in enumerate(results, start=1)]
-                observation = "\n".join(lines)
+                observation = self._format_memory_search_results(results, search_mode=search_args.search_mode)
             else:
                 observation = "memory_search 未找到相关记忆。"
             return ToolExecutionResult(
                 tool_name=tool_name,
                 observation_text=self._truncate_memory_text(observation),
-                payload={"query": query, "results": results},
-                tool_trace={"requested_tool": tool_name, "status": "ok", "result_count": len(results), "query": query},
+                payload={"search_args": search_args.model_dump(), "results": results},
+                tool_trace={
+                    "requested_tool": tool_name,
+                    "status": "ok",
+                    "result_count": len(results),
+                    "query": search_args.query,
+                    "search_mode": search_args.search_mode,
+                    "scope": search_args.scope,
+                },
                 terminal=False,
             )
 
         if tool_name == "memory_get":
-            target = str(tool_args["target"]).strip()
-            memory_doc = self.deps.workspace.memory_get(target=target)
-            content = memory_doc["content"] or "(empty)"
-            observation = f"{memory_doc['target']}:\n{self._truncate_memory_text(content)}"
+            memory_args = MemoryGetArgs.model_validate(tool_args)
+            memory_doc = self._memory_get(session, target=memory_args.target)
+            content = str(memory_doc.get("content") or "").strip()
+            resolved_target = str(memory_doc.get("resolved_target") or memory_doc["target"])
+            source_path = str(memory_doc.get("source_path") or "")
+            observation_preview = self._memory_observation_preview(content or "(empty)")
+            observation = (
+                f"target={resolved_target} source={source_path or '(empty)'} length={len(content)}\n"
+                f"preview:\n{observation_preview}"
+            )
+            self._remember_recent_content_reference(session, memory_doc)
             return ToolExecutionResult(
                 tool_name=tool_name,
                 observation_text=observation,
-                payload=memory_doc,
-                tool_trace={"requested_tool": tool_name, "status": "ok", "target": target},
-                terminal=False,
+                payload={**memory_doc, "delivery_mode": memory_args.delivery_mode},
+                tool_trace={
+                    "requested_tool": tool_name,
+                    "status": "ok",
+                    "target": memory_args.target,
+                    "resolved_target": resolved_target,
+                    "delivery_mode": memory_args.delivery_mode,
+                },
+                terminal=memory_args.delivery_mode == "deliver",
+                final_reply=content or "未找到对应内容。",
             )
 
         raise ValueError("unsupported_tool")
 
-    def _build_forced_compress_decision(self, user_text: str) -> DecisionOutput | None:
-        raw_text = self._extract_compression_raw_text(user_text)
-        if not self._should_force_compress(user_text, raw_text):
-            return None
-        return DecisionOutput(
-            domain="novel",
-            user_goal="压缩小说章节",
-            action="call_tool",
-            assistant_reply="",
-            tool_name="compress_chapter",
-            tool_args=self._build_default_compress_tool_args(raw_text),
-            memory_write=MemoryWrite(daily=["用户请求压缩小说章节"], long_term=[]),
+    def _should_review_direct_reply(self, *, used_tool: bool, review_passes: int) -> bool:
+        if used_tool:
+            return False
+        if not self.deps.config.decision_reflection_enabled:
+            return False
+        return review_passes < max(self.deps.config.decision_reflection_max_passes, 0)
+
+    def _review_direct_reply(
+        self,
+        *,
+        user_text: str,
+        decision: DecisionOutput,
+        context_bundle: Any,
+    ) -> DecisionReviewOutput:
+        reviewer = getattr(self.deps.decision_backend, "review_decision", None)
+        if not callable(reviewer):
+            return DecisionReviewOutput(verdict="accept", reason="review_backend_unavailable")
+        try:
+            review = reviewer(
+                messages=context_bundle.messages,
+                workspace_docs=context_bundle.workspace_docs,
+                session_summary=context_bundle.session_summary,
+                compacted_session_context=context_bundle.compacted_session_context,
+                recent_content_references=context_bundle.recent_content_references,
+                loop_events=context_bundle.loop_events,
+                decision=decision.model_dump(),
+                user_text=user_text,
+            )
+        except Exception as exc:
+            return DecisionReviewOutput(verdict="accept", reason=f"review_error:{exc}")
+        if isinstance(review, DecisionReviewOutput):
+            return review
+        try:
+            return DecisionReviewOutput.model_validate(review)
+        except ValidationError:
+            return DecisionReviewOutput(verdict="accept", reason="review_validation_failed")
+
+    def _compaction_manager(self) -> ContextCompactionManager | None:
+        return self.deps.compaction_manager
+
+    def _search_memory_sources(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+        search_mode: str = "lookup",
+        scope: str = "current_session",
+        time_scope: TimeScope | None = None,
+        exclude_latest_user_message: bool = True,
+    ) -> list[dict[str, Any]]:
+        if search_mode == "recap":
+            return self._search_recap_sources(
+                session=session,
+                query=query,
+                max_results=max_results,
+                scope=scope,
+                time_scope=time_scope,
+            )
+        return self._search_lookup_sources(
+            session=session,
+            query=query,
+            max_results=max_results,
+            scope=scope,
+            time_scope=time_scope,
+            exclude_latest_user_message=exclude_latest_user_message,
         )
 
-    def _should_force_compress(self, user_text: str, extracted_raw_text: str) -> bool:
-        text = user_text.strip()
-        if not text:
+    def _search_lookup_sources(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+        scope: str,
+        time_scope: TimeScope | None,
+        exclude_latest_user_message: bool,
+    ) -> list[dict[str, Any]]:
+        if scope == "current_session":
+            return self._merge_ranked_lookup_tiers(
+                [
+                    self._search_session_context(
+                        session=session,
+                        query=query,
+                        max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                        exclude_latest_user_message=exclude_latest_user_message,
+                    ),
+                    self._search_current_compact_context(
+                        session=session,
+                        query=query,
+                        max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                    ),
+                    self.deps.workspace.memory_search(
+                        query=query,
+                        max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                    ),
+                ],
+                max_results=max_results,
+            )
+        return self._merge_ranked_lookup_tiers(
+            [
+                self._search_compact_history_context(
+                    session=session,
+                    query=query,
+                    max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                    scope=scope,
+                    time_scope=time_scope,
+                ),
+                self._search_archived_session_context(
+                    session=session,
+                    query=query,
+                    max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                    scope=scope,
+                    time_scope=time_scope,
+                ),
+                self.deps.workspace.memory_search(
+                    query=query,
+                    max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                ),
+            ],
+            max_results=max_results,
+        )
+
+    def _search_recap_sources(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+        scope: str,
+        time_scope: TimeScope | None,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        manager = self._compaction_manager()
+        if manager is None:
+            return []
+
+        if scope == "current_session":
+            artifact = manager.load_or_build_artifact(session)
+            results.append(self._build_recap_result_from_artifact(query=query, artifact=artifact))
+            return results[:max_results]
+
+        if scope == "time_window" and time_scope is not None:
+            window_summary = manager.build_time_window_summary(
+                from_days_ago=time_scope.from_days_ago,
+                to_days_ago=time_scope.to_days_ago,
+            )
+            results.append(
+                {
+                    "source_id": window_summary["target"],
+                    "source_kind": "time_window_summary",
+                    "source_path": window_summary["time_range"],
+                    "target": window_summary["target"],
+                    "score": max(hybrid_search_score(query, window_summary["content"]), 0.5),
+                    "summary_preview": window_summary["summary_preview"],
+                    "topics": window_summary["topics"],
+                    "time_range": window_summary["time_range"],
+                    "session_id": "time_window",
+                    "snippet": window_summary["summary_preview"],
+                }
+            )
+            for artifact in manager.artifacts_for_time_window(time_scope.from_days_ago, time_scope.to_days_ago)[:max_results]:
+                results.append(self._build_recap_result_from_artifact(query=query, artifact=artifact))
+            return self._rerank_search_results(results, max_results=max_results)
+
+        for artifact in self._history_compaction_artifacts(session, scope=scope, time_scope=time_scope):
+            results.append(self._build_recap_result_from_artifact(query=query, artifact=artifact))
+        return self._rerank_search_results(results, max_results=max_results)
+
+    def _build_recap_result_from_artifact(self, *, query: str, artifact: Any) -> dict[str, Any]:
+        manager = self._compaction_manager()
+        assert manager is not None
+        preview = manager.search_chunks(artifact)[0]["summary_preview"]
+        return {
+            "source_id": f"session_compact:{artifact.session_id}",
+            "source_kind": "session_compact",
+            "source_path": artifact.session_id,
+            "target": f"session_compact:{artifact.session_id}",
+            "score": hybrid_search_score(query, preview + "\n" + render_compact_summary_text(artifact)),
+            "summary_preview": preview,
+            "topics": ", ".join(artifact.discussion_topics),
+            "time_range": artifact.updated_at[:10] if artifact.updated_at else "",
+            "session_id": artifact.session_id,
+            "snippet": preview,
+        }
+
+    def _search_session_context(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+        exclude_latest_user_message: bool = False,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        last_user_index = len(session.messages)
+        for index, item in enumerate(session.messages, start=1):
+            if exclude_latest_user_message and index == last_user_index and item.role == "user":
+                continue
+            score, snippet = self._score_text_match(query, item.content)
+            if score <= 0:
+                continue
+            role = item.role or "unknown"
+            recency_boost = 1.0 + 0.35 * (index / max(len(session.messages), 1))
+            results.append(
+                {
+                    "source_id": f"session:{role}:{index}",
+                    "source_kind": "session",
+                    "source_path": "session",
+                    "target": f"session:{role}:{index}",
+                    "score": score * recency_boost,
+                    "snippet": snippet,
+                }
+            )
+        results.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        return results[:max_results]
+
+    def _search_current_compact_context(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        manager = self._compaction_manager()
+        if manager is None:
+            return []
+        artifact = manager.load_or_build_artifact(session)
+        return self._search_compact_artifact_chunks(query=query, artifacts=[artifact], max_results=max_results)
+
+    def _search_archived_session_context(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+        scope: str,
+        time_scope: TimeScope | None,
+    ) -> list[dict[str, Any]]:
+        store = self.deps.session_store
+        if store is None or max_results <= 0:
+            return []
+
+        results: list[dict[str, Any]] = []
+        per_session_limit = max(self.deps.config.archive_session_search_messages_per_session, 1)
+        for session_id in self._history_session_ids(session, scope=scope, time_scope=time_scope):
+            archived_session = store.load_session(session_id)
+            if archived_session is None:
+                continue
+            recent_messages = archived_session.messages[-per_session_limit:]
+            base_index = max(len(archived_session.messages) - len(recent_messages), 0)
+            for offset, item in enumerate(recent_messages, start=1):
+                score, snippet = self._score_text_match(query, item.content)
+                if score <= 0:
+                    continue
+                absolute_index = base_index + offset
+                results.append(
+                    {
+                        "source_id": f"session:{session_id}:{item.role}:{absolute_index}",
+                        "source_kind": "session_archive",
+                        "source_path": session_id,
+                        "target": f"session:{session_id}:{item.role}:{absolute_index}",
+                        "score": score,
+                        "snippet": snippet,
+                    }
+                )
+        results.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        return results[:max_results]
+
+    def _search_compact_history_context(
+        self,
+        *,
+        session: SessionState,
+        query: str,
+        max_results: int,
+        scope: str,
+        time_scope: TimeScope | None,
+    ) -> list[dict[str, Any]]:
+        artifacts = self._history_compaction_artifacts(session, scope=scope, time_scope=time_scope)
+        return self._search_compact_artifact_chunks(query=query, artifacts=artifacts, max_results=max_results)
+
+    def _search_compact_artifact_chunks(
+        self,
+        *,
+        query: str,
+        artifacts: list[Any],
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        manager = self._compaction_manager()
+        if manager is None:
+            return []
+        results: list[dict[str, Any]] = []
+        for artifact in artifacts:
+            for chunk in manager.search_chunks(artifact):
+                score = hybrid_search_score(query, chunk["text"])
+                if score <= 0:
+                    continue
+                results.append(
+                    {
+                        "source_id": chunk["target"],
+                        "source_kind": chunk["source_kind"],
+                        "source_path": chunk["source_path"],
+                        "target": chunk["target"],
+                        "score": score,
+                        "snippet": extract_snippet(chunk["text"], query, max_chars=220),
+                        "summary_preview": chunk["summary_preview"],
+                        "topics": chunk["topics"],
+                        "time_range": chunk["time_range"],
+                        "session_id": chunk["session_id"],
+                    }
+                )
+        return self._rerank_search_results(
+            self._prefer_specific_compact_targets(results),
+            max_results=max_results,
+        )
+
+    def _prefer_specific_compact_targets(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not results:
+            return []
+
+        specific_targets_by_session: dict[str, list[dict[str, Any]]] = {}
+        for item in results:
+            target = str(item.get("target") or "")
+            session_id = str(item.get("session_id") or "")
+            if "#compression_history:" not in target or not session_id:
+                continue
+            specific_targets_by_session.setdefault(session_id, []).append(item)
+
+        adjusted: list[dict[str, Any]] = []
+        for item in results:
+            payload = dict(item)
+            target = str(payload.get("target") or "")
+            session_id = str(payload.get("session_id") or "")
+            score = float(payload.get("score", 0.0))
+            specific_targets = specific_targets_by_session.get(session_id, [])
+            if target.startswith("session_compact:") and "#compression_history:" in target:
+                payload["score"] = score + 0.25
+            elif target == f"session_compact:{session_id}" and specific_targets:
+                payload["score"] = score * 0.35
+            adjusted.append(payload)
+        return adjusted
+
+    def _history_compaction_artifacts(
+        self,
+        session: SessionState,
+        *,
+        scope: str,
+        time_scope: TimeScope | None,
+    ) -> list[Any]:
+        manager = self._compaction_manager()
+        if manager is None:
+            return []
+        if scope == "time_window" and time_scope is not None:
+            return manager.artifacts_for_time_window(time_scope.from_days_ago, time_scope.to_days_ago)
+        artifacts: list[Any] = []
+        for session_id in self._history_session_ids(session, scope=scope, time_scope=time_scope):
+            artifact = manager.load_or_build_artifact_for_session_id(session_id)
+            if artifact is not None:
+                artifacts.append(artifact)
+        return artifacts
+
+    def _history_session_ids(
+        self,
+        session: SessionState,
+        *,
+        scope: str,
+        time_scope: TimeScope | None,
+    ) -> list[str]:
+        store = self.deps.session_store
+        if store is None:
+            return []
+        infos = store.list_session_infos()
+        results: list[str] = []
+        for item in infos:
+            session_id = str(item.get("session_id", "")).strip()
+            if not session_id or session_id == session.session_id:
+                continue
+            if scope == "time_window" and time_scope is not None:
+                updated_at = str(item.get("updated_at", ""))
+                if not self._timestamp_matches_time_scope(updated_at, time_scope):
+                    continue
+            results.append(session_id)
+            if len(results) >= self.deps.config.archive_session_search_limit:
+                break
+        return results
+
+    def _timestamp_matches_time_scope(self, timestamp: str, time_scope: TimeScope) -> bool:
+        if not timestamp:
             return False
-        if not any(keyword in text for keyword in COMPRESSION_KEYWORDS):
+        date_text = timestamp[:10]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
             return False
-        has_attached_body = extracted_raw_text.strip() != text and len(extracted_raw_text.strip()) >= 20
-        if has_attached_body and any(keyword in text for keyword in NOVEL_COMPRESSION_TARGET_KEYWORDS):
-            return True
-        if any(keyword in text for keyword in CODE_LIKE_KEYWORDS):
-            return False
-        if has_attached_body:
-            return True
-        return len(text) >= 120 and ("\n" in text or "“" in text or "”" in text)
+        target_day = date.fromisoformat(date_text)
+        older_bound = max(time_scope.from_days_ago, time_scope.to_days_ago)
+        newer_bound = min(time_scope.from_days_ago, time_scope.to_days_ago)
+        lower = date.today() - timedelta(days=older_bound)
+        upper = date.today() - timedelta(days=newer_bound)
+        return lower <= target_day <= upper
 
-    def _extract_compression_raw_text(self, user_text: str) -> str:
-        text = user_text.strip()
-        if not text:
-            return text
+    def _rerank_search_results(self, results: list[dict[str, Any]], *, max_results: int) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen = set()
+        for item in sorted(results, key=lambda payload: float(payload.get("score", 0.0)), reverse=True):
+            key = (item["source_id"], item.get("target"), item.get("snippet"), item.get("summary_preview"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        if not deduped:
+            return []
+        return mmr_rerank(
+            deduped[: max(max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER, max_results)],
+            limit=max_results,
+            text_key="snippet",
+        )
 
-        if "\n\n" in text:
-            head, tail = text.split("\n\n", 1)
-            if any(keyword in head for keyword in COMPRESSION_KEYWORDS) and len(tail.strip()) >= 20:
-                return tail.strip()
+    def _merge_ranked_lookup_tiers(
+        self,
+        tiers: list[list[dict[str, Any]]],
+        *,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen = set()
+        for tier_index, tier in enumerate(tiers):
+            tier_bias = max(0.0, 0.06 * (len(tiers) - tier_index - 1))
+            for item in self._rerank_search_results(
+                tier,
+                max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+            ):
+                key = (item["source_id"], item.get("target"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                payload = dict(item)
+                payload["score"] = float(payload.get("score", 0.0)) + tier_bias
+                merged.append(payload)
+        return self._rerank_search_results(merged, max_results=max_results)
 
-        lines = [line.rstrip() for line in text.splitlines()]
-        if len(lines) >= 2 and any(keyword in lines[0] for keyword in COMPRESSION_KEYWORDS):
-            tail = "\n".join(lines[1:]).strip()
-            if len(tail) >= 20:
-                return tail
+    def _score_text_match(self, query: str, content: str) -> tuple[float, str]:
+        clean_query = query.strip()
+        text = content.strip()
+        if not clean_query or not text:
+            return 0.0, ""
+        score = hybrid_search_score(clean_query, text)
+        if score <= 0:
+            return 0.0, ""
+        return score, extract_snippet(text, clean_query, max_chars=220)
 
-        for sep in ("：", ":"):
-            if sep in text:
-                head, tail = text.split(sep, 1)
-                if any(keyword in head for keyword in COMPRESSION_KEYWORDS) and len(tail.strip()) >= 20:
-                    return tail.strip()
+    def _format_memory_search_results(self, results: list[dict[str, Any]], *, search_mode: str) -> str:
+        lines: list[str] = []
+        for index, item in enumerate(results, start=1):
+            source_kind = str(item.get("source_kind") or "memory")
+            target = str(item.get("target") or item["source_id"])
+            source_path = str(item.get("source_path") or "")
+            score = float(item.get("score", 0.0))
+            lines.append(f"{index}. [{source_kind}] target={target} score={score:.3f}")
+            if source_path:
+                lines.append(f"source: {source_path}")
+            if search_mode == "recap":
+                topics = str(item.get("topics") or "(empty)")
+                time_range = str(item.get("time_range") or "(empty)")
+                preview = str(item.get("summary_preview") or item.get("snippet") or "")
+                lines.append(f"time_range: {time_range}")
+                lines.append(f"topics: {topics}")
+                lines.append(f"summary_preview: {preview}")
+            else:
+                lines.append(f"snippet: {item['snippet']}")
+        return "\n".join(lines)
 
-        return text
+    def _memory_get(self, session: SessionState, *, target: str) -> dict[str, Any]:
+        requested_target = target.strip()
+        clean_target = self._resolve_recent_content_target(session, requested_target)
+        if clean_target.startswith("session_compact:"):
+            payload = self._memory_get_compact(clean_target)
+        elif clean_target.startswith("session:"):
+            payload = self._memory_get_session(session, clean_target)
+        else:
+            payload = self.deps.workspace.memory_get(target=clean_target)
+        payload["target"] = requested_target
+        payload["resolved_target"] = str(payload.get("resolved_target") or clean_target)
+        return payload
+
+    def _memory_get_compact(self, target: str) -> dict[str, Any]:
+        manager = self._compaction_manager()
+        if manager is None:
+            raise ValueError("unsupported_memory_target")
+
+        time_window_match = re.fullmatch(r"session_compact:time_window:(\d+)-(\d+)#summary", target)
+        if time_window_match:
+            from_days_ago = int(time_window_match.group(1))
+            to_days_ago = int(time_window_match.group(2))
+            summary = manager.build_time_window_summary(from_days_ago, to_days_ago)
+            return {
+                "target": target,
+                "resolved_target": target,
+                "source_path": summary["time_range"],
+                "content": summary["content"],
+                "line_start": 1,
+                "line_end": max(len(str(summary["content"]).splitlines()), 1),
+            }
+
+        session_match = re.fullmatch(r"session_compact:([0-9a-f]{32})(?:#(?P<section>[^:]+):(?P<index>\d+))?", target)
+        if not session_match:
+            raise ValueError("unsupported_memory_target")
+
+        session_id = session_match.group(1)
+        artifact = manager.load_or_build_artifact_for_session_id(session_id)
+        if artifact is None:
+            content = ""
+        else:
+            section = session_match.group("section")
+            index_text = session_match.group("index")
+            if section == "compression_history" and index_text is not None:
+                item_index = int(index_text)
+                if 0 <= item_index < len(artifact.compression_history):
+                    item = artifact.compression_history[item_index]
+                    content = self._compression_full_content(session_id=session_id, turn_index=item.turn_index)
+                    if not content:
+                        content = "\n".join(
+                            [
+                                f"turn_index: {item.turn_index}",
+                                f"user_request: {item.user_request}",
+                                f"compressed_preview: {item.compressed_preview}",
+                                f"entities: {', '.join(item.entities)}",
+                                f"timestamp: {item.timestamp}",
+                            ]
+                        ).strip()
+                else:
+                    content = ""
+            else:
+                content = render_compact_summary_text(artifact)
+        return {
+            "target": target,
+            "resolved_target": target,
+            "source_path": session_id,
+            "content": content,
+            "line_start": 1,
+            "line_end": max(len(content.splitlines()), 1),
+        }
+
+    def _compression_full_content(self, *, session_id: str, turn_index: int) -> str:
+        store = self.deps.session_store
+        if store is None:
+            return ""
+        for record in store.load_turn_records(session_id):
+            if int(record.get("turn_index", 0)) != turn_index:
+                continue
+            tool_trace = record.get("tool_trace") or {}
+            if tool_trace.get("requested_tool") != "compress_chapter":
+                continue
+            return str(record.get("assistant_reply", "")).strip()
+        return ""
+
+    def _latest_session_compression_record(self, session_id: str) -> dict[str, Any] | None:
+        store = self.deps.session_store
+        if store is None:
+            return None
+        records: list[dict[str, Any]] = []
+        for record in store.load_turn_records(session_id):
+            tool_trace = record.get("tool_trace") or {}
+            if tool_trace.get("requested_tool") != "compress_chapter":
+                continue
+            assistant_reply = str(record.get("assistant_reply", "")).strip()
+            if not assistant_reply:
+                continue
+            turn_index = int(record.get("turn_index", 0))
+            records.append(
+                {
+                    "turn_index": turn_index,
+                    "assistant_reply": assistant_reply,
+                    "timestamp": str(record.get("timestamp", "")).strip(),
+                }
+            )
+        if not records:
+            return None
+        records.sort(key=lambda item: (str(item.get("timestamp", "")), int(item.get("turn_index", 0))), reverse=True)
+        return records[0]
+
+    def _latest_session_compression_content(self, session_id: str) -> str:
+        record = self._latest_session_compression_record(session_id)
+        if record is None:
+            return ""
+        return str(record.get("assistant_reply", "")).strip()
+
+    def _memory_get_session(self, session: SessionState, target: str) -> dict[str, Any]:
+        if target == "session:latest_compress":
+            content = self._latest_session_compression_content(session.session_id)
+            return {
+                "target": target,
+                "resolved_target": target,
+                "source_path": session.session_id,
+                "content": content,
+                "line_start": 1,
+                "line_end": max(len(content.splitlines()), 1),
+            }
+
+        archived_latest = re.fullmatch(r"session:([0-9a-f]{32}):latest_compress", target)
+        if archived_latest:
+            session_id = archived_latest.group(1)
+            content = self._latest_session_compression_content(session_id)
+            return {
+                "target": target,
+                "resolved_target": target,
+                "source_path": session_id,
+                "content": content,
+                "line_start": 1,
+                "line_end": max(len(content.splitlines()), 1),
+            }
+
+        match = re.fullmatch(r"session:(?:(?P<session_id>[0-9a-f]{32}):)?(?P<role>user|assistant):(?P<index>\d+)", target)
+        if not match:
+            raise ValueError("unsupported_memory_target")
+        target_session_id = match.group("session_id") or session.session_id
+        role = str(match.group("role"))
+        index = int(match.group("index"))
+        target_session = session if target_session_id == session.session_id else None
+        if target_session is None and self.deps.session_store is not None:
+            target_session = self.deps.session_store.load_session(target_session_id)
+        if target_session is None or index <= 0 or index > len(target_session.messages):
+            content = ""
+        else:
+            message = target_session.messages[index - 1]
+            content = message.content if message.role == role else ""
+        return {
+            "target": target,
+            "resolved_target": target,
+            "source_path": target_session_id,
+            "content": content,
+            "line_start": 1,
+            "line_end": max(len(content.splitlines()), 1),
+        }
+
+    def _resolve_recent_content_target(self, session: SessionState, target: str) -> str:
+        clean = target.strip()
+        if not clean.startswith("content_ref:"):
+            return clean
+        references = self._recent_content_references(session)
+        if not references:
+            raise ValueError("unknown_content_reference")
+        if clean == "content_ref:latest":
+            return references[0].resolved_target
+        for item in references:
+            if item.alias == clean:
+                return item.resolved_target
+        raise ValueError("unknown_content_reference")
+
+    def _remember_recent_content_reference(self, session: SessionState, memory_doc: dict[str, Any]) -> None:
+        if self.deps.meta_store is None:
+            return
+        content = str(memory_doc.get("content") or "").strip()
+        resolved_target = str(memory_doc.get("resolved_target") or "").strip()
+        if not content or not resolved_target:
+            return
+
+        meta = self.deps.meta_store.get_or_create(session.session_id)
+        references: list[RecentContentReference] = []
+        for payload in meta.recent_content_references:
+            try:
+                reference = RecentContentReference.model_validate(payload)
+            except ValidationError:
+                continue
+            if reference.resolved_target == resolved_target:
+                continue
+            references.append(reference)
+
+        preview = self._memory_observation_preview(content)
+        references.insert(
+            0,
+            RecentContentReference(
+                alias="",
+                resolved_target=resolved_target,
+                source_path=str(memory_doc.get("source_path") or ""),
+                preview=preview,
+                content_length=len(content),
+                created_turn_index=max((len(session.messages) + 1) // 2, 1),
+            ),
+        )
+        references = references[:3]
+        for index, item in enumerate(references):
+            item.alias = "content_ref:latest" if index == 0 else f"content_ref:{index}"
+
+        meta.recent_content_references = [item.model_dump() for item in references]
+        self.deps.meta_store.save(meta)
+
+    def _recent_content_references(self, session: SessionState) -> list[RecentContentReference]:
+        if self.deps.meta_store is None:
+            return []
+        meta = self.deps.meta_store.load(session.session_id)
+        if meta is None:
+            return []
+        references: list[RecentContentReference] = []
+        for payload in meta.recent_content_references[:3]:
+            try:
+                references.append(RecentContentReference.model_validate(payload))
+            except ValidationError:
+                continue
+        return references
 
     def _merge_memory_write(self, target: MemoryWrite, incoming: MemoryWrite | None) -> None:
         if incoming is None:
@@ -436,12 +1133,45 @@ class NovelAgentController:
             if entry not in target.long_term:
                 target.long_term.append(entry)
 
+    def _merge_context_report(self, target: ContextReport, incoming: ContextReport) -> ContextReport:
+        target.estimated_tokens = max(target.estimated_tokens, incoming.estimated_tokens)
+        target.pruning_applied = target.pruning_applied or incoming.pruning_applied
+        target.compaction_applied = target.compaction_applied or incoming.compaction_applied
+        target.compaction_source = incoming.compaction_source or target.compaction_source
+        target.memory_flush_applied = target.memory_flush_applied or incoming.memory_flush_applied
+        target.review_triggered = target.review_triggered or incoming.review_triggered
+        target.review_verdict = incoming.review_verdict or target.review_verdict
+        target.review_reason = incoming.review_reason or target.review_reason
+        for item in incoming.recall_targets:
+            if item not in target.recall_targets:
+                target.recall_targets.append(item)
+        for item in incoming.context_blocks:
+            if item not in target.context_blocks:
+                target.context_blocks.append(item)
+        for item in incoming.memory_flush_daily:
+            if item not in target.memory_flush_daily:
+                target.memory_flush_daily.append(item)
+        for item in incoming.memory_flush_long_term:
+            if item not in target.memory_flush_long_term:
+                target.memory_flush_long_term.append(item)
+        return target
+
     def _truncate_memory_text(self, text: str) -> str:
         clean = text.strip()
         max_chars = self.deps.config.memory_tool_max_chars
         if len(clean) <= max_chars:
             return clean
         return clean[:max_chars].rstrip() + "..."
+
+    def _memory_observation_preview(self, text: str) -> str:
+        clean = text.strip()
+        if not clean:
+            return "(empty)"
+        preview_limit = min(
+            self.deps.config.memory_tool_max_chars,
+            max(self.deps.config.context_micro_preview_chars * 2, 240),
+        )
+        return extract_snippet(clean, clean, max_chars=preview_limit)
 
     def _build_default_compress_tool_args(self, raw_text: str) -> dict[str, Any]:
         tool_args = {
@@ -480,8 +1210,12 @@ class NovelAgentController:
         tool_trace: dict[str, Any] | None = None,
         thinking: str = "",
         memory_write: MemoryWrite | None = None,
+        context_report: ContextReport | None = None,
     ) -> AgentTurnResult:
         session.add_assistant_message(reply)
+        session.refresh_summary(self.deps.config.session_summary_max_chars)
+        if context_report is not None:
+            transcript_events.append(self._event((len(session.messages) // 2), "context_report", payload=context_report.model_dump()))
         transcript_events.append(
             self._event((len(session.messages) // 2), "assistant_message", role="assistant", content=reply)
         )
@@ -502,6 +1236,7 @@ class NovelAgentController:
             thinking=thinking,
             memory_preview=preview,
             transcript_events=transcript_events,
+            context_report=(context_report.model_dump() if context_report is not None else {}),
         )
 
     def _finalize_error(
@@ -511,8 +1246,12 @@ class NovelAgentController:
         transcript_events: list[dict[str, Any]],
         decision: dict[str, Any] | None = None,
         tool_trace: dict[str, Any] | None = None,
+        context_report: ContextReport | None = None,
     ) -> AgentTurnResult:
         session.add_assistant_message(reply)
+        session.refresh_summary(self.deps.config.session_summary_max_chars)
+        if context_report is not None:
+            transcript_events.append(self._event((len(session.messages) // 2), "context_report", payload=context_report.model_dump()))
         transcript_events.append(
             self._event((len(session.messages) // 2), "assistant_message", role="assistant", content=reply)
         )
@@ -525,4 +1264,5 @@ class NovelAgentController:
             thinking="",
             memory_preview={"daily": [], "long_term": []},
             transcript_events=transcript_events,
+            context_report=(context_report.model_dump() if context_report is not None else {}),
         )

@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from ..config import AgentConfig
-from ..prompts import build_decision_system_prompt
-from ..schemas import BackendHealth, DecisionOutput
+from ..prompts import build_decision_review_system_prompt, build_decision_system_prompt
+from ..schemas import BackendHealth, DecisionOutput, DecisionReviewOutput
 from ..utils import extract_json_object, split_think_and_answer
 from .base import BaseBackend
 
@@ -35,13 +35,25 @@ def _has_accelerate() -> bool:
     return True
 
 
+def _preferred_cuda_dtype(torch_module: Any):
+    try:
+        if hasattr(torch_module.cuda, "is_bf16_supported") and torch_module.cuda.is_bf16_supported():
+            return torch_module.bfloat16
+    except Exception:
+        pass
+    return torch_module.float16
+
+
 def _select_model_runtime(torch_module: Any) -> dict[str, Any]:
-    if _has_accelerate():
-        try:
-            if torch_module.cuda.is_available():
-                return {"dtype": torch_module.bfloat16, "device_map": "auto", "device": "cuda"}
-        except Exception:
-            pass
+    try:
+        if torch_module.cuda.is_available():
+            return {
+                "dtype": _preferred_cuda_dtype(torch_module),
+                "device_map": "auto" if _has_accelerate() else None,
+                "device": "cuda:0",
+            }
+    except Exception:
+        pass
     return {"dtype": torch_module.float32, "device_map": None, "device": "cpu"}
 
 
@@ -133,12 +145,62 @@ class LocalDecisionBackend(BaseBackend):
         messages: list[dict[str, str]],
         workspace_docs: str,
         session_summary: str,
+        compacted_session_context: str = "",
+        recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
     ) -> DecisionOutput:
-        self._ensure_loaded(load_model=True)
+        payload = self._generate_json_payload(
+            system_prompt=build_decision_system_prompt(workspace_docs),
+            user_content=(
+                "请根据以下对话和会话摘要输出决策 JSON。\n\n"
+                f"Session Summary:\n{session_summary or '(empty)'}\n\n"
+                f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
+                f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
+                f"Messages:\n{json.dumps(messages, ensure_ascii=False)}\n\n"
+                f"Loop Events:\n{json.dumps(loop_events or [], ensure_ascii=False)}"
+            ),
+        )
+        return DecisionOutput.model_validate(payload)
+
+    def review_decision(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        workspace_docs: str,
+        session_summary: str,
+        compacted_session_context: str = "",
+        recent_content_references: str = "",
+        loop_events: list[dict[str, Any]] | None = None,
+        decision: dict[str, Any],
+        user_text: str,
+    ) -> DecisionReviewOutput:
+        payload = self._generate_json_payload(
+            system_prompt=build_decision_review_system_prompt(workspace_docs),
+            user_content=(
+                "请判断下面这条 direct_reply 是否已经有足够证据支撑。\n\n"
+                f"User Message:\n{user_text}\n\n"
+                f"Session Summary:\n{session_summary or '(empty)'}\n\n"
+                f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
+                f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
+                f"Messages:\n{json.dumps(messages, ensure_ascii=False)}\n\n"
+                f"Loop Events:\n{json.dumps(loop_events or [], ensure_ascii=False)}\n\n"
+                f"Candidate Decision:\n{json.dumps(decision, ensure_ascii=False)}"
+            ),
+        )
+        return DecisionReviewOutput.model_validate(payload)
+
+    def estimate_prompt_tokens(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        workspace_docs: str,
+        session_summary: str,
+        compacted_session_context: str = "",
+        recent_content_references: str = "",
+        loop_events: list[dict[str, Any]] | None = None,
+    ) -> int:
+        self._ensure_loaded(load_model=False)
         assert self._tokenizer is not None
-        assert self._model is not None
-        assert self._torch is not None
 
         system_prompt = build_decision_system_prompt(workspace_docs)
         request_messages = [
@@ -148,6 +210,8 @@ class LocalDecisionBackend(BaseBackend):
                 "content": (
                     "请根据以下对话和会话摘要输出决策 JSON。\n\n"
                     f"Session Summary:\n{session_summary or '(empty)'}\n\n"
+                    f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
+                    f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
                     f"Messages:\n{json.dumps(messages, ensure_ascii=False)}\n\n"
                     f"Loop Events:\n{json.dumps(loop_events or [], ensure_ascii=False)}"
                 ),
@@ -166,10 +230,36 @@ class LocalDecisionBackend(BaseBackend):
                 tokenize=False,
                 add_generation_prompt=True,
             )
+        tokenized = self._tokenizer([prompt], return_tensors="pt")
+        return int(tokenized.input_ids.shape[-1])
+
+    def _generate_json_payload(self, *, system_prompt: str, user_content: str) -> dict[str, Any]:
+        self._ensure_loaded(load_model=True)
+        assert self._tokenizer is not None
+        assert self._model is not None
+        assert self._torch is not None
+
+        request_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        try:
+            prompt = self._tokenizer.apply_chat_template(
+                request_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=self.config.decision_enable_thinking,
+            )
+        except TypeError:
+            prompt = self._tokenizer.apply_chat_template(
+                request_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         model_inputs = self._tokenizer([prompt], return_tensors="pt").to(_model_device(self._model, self._torch))
         generated_ids = self._model.generate(
             **model_inputs,
-            max_new_tokens=self.config.decision_max_new_tokens,
+            max_new_tokens=self.config.decision_output_max_new_tokens,
             temperature=self.config.decision_temperature,
             top_p=self.config.decision_top_p,
             top_k=self.config.decision_top_k,
@@ -177,5 +267,4 @@ class LocalDecisionBackend(BaseBackend):
         )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
         _, answer = split_think_and_answer(self._tokenizer, output_ids)
-        payload = extract_json_object(answer)
-        return DecisionOutput.model_validate(payload)
+        return extract_json_object(answer)

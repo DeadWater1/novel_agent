@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import html
+import os
+import threading
+import time
 from typing import Any
 
-from .backends import LocalCompressionBackend, LocalDecisionBackend
+from .backends import LocalCompressionBackend, LocalDecisionBackend, LocalSummaryBackend
+from .compaction import ContextCompactionManager
 from .config import AgentConfig
 from .controller import ControllerDependencies, NovelAgentController
 from .heartbeat import HeartbeatManager
@@ -11,6 +15,8 @@ from .memory import SessionState, SessionStore
 from .registry import build_default_registry
 from .session_meta import SessionMetaStore
 from .workspace import WorkspaceManager
+
+DEFAULT_SERVER_PORT_CANDIDATES = (7860, 7861, 7862, 9888, 9988, 17860, 27860)
 
 
 APP_CSS = """
@@ -39,7 +45,7 @@ body,
 }
 
 .gradio-container {
-  max-width: 1440px !important;
+  max-width: 1560px !important;
   padding: 24px 20px 32px !important;
 }
 
@@ -189,7 +195,7 @@ body,
 }
 
 .chat-shell {
-  height: 620px;
+  height: 760px;
   padding: 22px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.06)),
@@ -272,7 +278,7 @@ body,
 }
 
 .chat-bubble {
-  max-width: min(86%, 780px);
+  max-width: min(92%, 980px);
   padding: 14px 16px 13px;
   border-radius: 22px;
   border: 1px solid rgba(125, 98, 70, 0.14);
@@ -326,6 +332,40 @@ body,
 
 .panel-shell {
   padding: 18px 18px 16px;
+}
+
+.panel-body {
+  min-width: 0;
+}
+
+.panel-body-scroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.22) transparent;
+}
+
+.panel-body-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.panel-body-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.20);
+  border-radius: 999px;
+}
+
+.panel-body-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.runtime-scroll {
+  max-height: 280px;
+  padding-right: 4px;
+}
+
+.loop-scroll {
+  max-height: 420px;
+  padding-right: 4px;
 }
 
 .panel-kicker {
@@ -456,7 +496,15 @@ body,
   }
 
   .chat-shell {
-    height: 520px;
+    height: 620px;
+  }
+
+  .runtime-scroll {
+    max-height: 250px;
+  }
+
+  .loop-scroll {
+    max-height: 360px;
   }
 }
 
@@ -485,10 +533,87 @@ body,
   }
 
   .chat-shell {
-    height: 460px;
+    height: 540px;
+  }
+
+  .runtime-scroll {
+    max-height: 220px;
+  }
+
+  .loop-scroll {
+    max-height: 300px;
   }
 }
 """
+
+
+APP_HEAD = """
+<script>
+(() => {
+  const CHAT_ROOT_ID = "chatbot-view";
+
+  function scrollChatToBottom(container) {
+    const shell = container?.querySelector(".chat-shell");
+    if (!shell) {
+      return;
+    }
+    shell.scrollTop = shell.scrollHeight;
+  }
+
+  function bindChatAutoScroll() {
+    const container = document.getElementById(CHAT_ROOT_ID);
+    if (!container) {
+      return false;
+    }
+    scrollChatToBottom(container);
+    if (container.dataset.autoscrollBound === "1") {
+      return true;
+    }
+    container.dataset.autoscrollBound = "1";
+    const observer = new MutationObserver(() => {
+      window.requestAnimationFrame(() => scrollChatToBottom(container));
+    });
+    observer.observe(container, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return true;
+  }
+
+  function installAutoScroll() {
+    if (bindChatAutoScroll()) {
+      return;
+    }
+    const pageObserver = new MutationObserver(() => {
+      if (bindChatAutoScroll()) {
+        pageObserver.disconnect();
+      }
+    });
+    pageObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", installAutoScroll, { once: true });
+  } else {
+    installAutoScroll();
+  }
+})();
+</script>
+"""
+
+
+CAPTURE_AND_CLEAR_INPUT_JS = """
+(user_message) => {
+  const clean = typeof user_message === "string" ? user_message : "";
+  return [clean, ""];
+}
+""".strip()
+
+PROCESSING_PLACEHOLDER = "正在处理..."
 
 
 def _import_gradio() -> Any:
@@ -511,6 +636,14 @@ class NovelAgentApplication:
         self.registry = build_default_registry()
         self.decision_backend = LocalDecisionBackend(self.config)
         self.compression_backend = LocalCompressionBackend(self.config)
+        self.summary_backend = LocalSummaryBackend(self.config, shared_backend=self.decision_backend)
+        self.compaction_manager = ContextCompactionManager(
+            self.config,
+            self.session_store,
+            self.meta_store,
+            summary_backend=self.summary_backend,
+        )
+        self.compaction_manager.bootstrap()
         self.controller = NovelAgentController(
             ControllerDependencies(
                 config=self.config,
@@ -518,6 +651,9 @@ class NovelAgentApplication:
                 registry=self.registry,
                 decision_backend=self.decision_backend,
                 compression_backend=self.compression_backend,
+                session_store=self.session_store,
+                meta_store=self.meta_store,
+                compaction_manager=self.compaction_manager,
             )
         )
         self.heartbeat = HeartbeatManager(
@@ -525,8 +661,9 @@ class NovelAgentApplication:
             session_store=self.session_store,
             meta_store=self.meta_store,
             workspace=self.workspace,
+            compaction_manager=self.compaction_manager,
         )
-        self.heartbeat.run_idle_heartbeat_once(max_sessions=20)
+        self._startup_maintenance_started = False
 
     def new_session(self) -> SessionState:
         session = self.session_store.create_session()
@@ -545,7 +682,12 @@ class NovelAgentApplication:
     def backend_status(self) -> dict[str, dict[str, Any]]:
         decision = self.decision_backend.healthcheck().model_dump()
         compression = self.compression_backend.healthcheck().model_dump()
-        return {"decision_backend": decision, "compression_backend": compression}
+        summary = self.summary_backend.healthcheck().model_dump()
+        return {
+            "decision_backend": decision,
+            "compression_backend": compression,
+            "summary_backend": summary,
+        }
 
     def handle_chat(self, session: SessionState, user_text: str) -> dict[str, Any]:
         result = self.controller.handle_user_message(session, user_text)
@@ -557,8 +699,24 @@ class NovelAgentApplication:
             "transcript_events": result.transcript_events,
             "thinking": result.thinking if self.config.show_debug_thinking else "",
             "memory_preview": result.memory_preview,
+            "context_report": result.context_report,
             "session": session,
         }
+
+    def start_startup_maintenance(self, *, delay_seconds: float = 3.0, max_sessions: int = 20) -> None:
+        if self._startup_maintenance_started:
+            return
+        self._startup_maintenance_started = True
+
+        def _worker() -> None:
+            time.sleep(delay_seconds)
+            try:
+                self.heartbeat.run_idle_heartbeat_once(max_sessions=max_sessions)
+            except Exception:
+                # Startup maintenance is best-effort and should never block the UI.
+                return
+
+        threading.Thread(target=_worker, name="novel-agent-startup-maintenance", daemon=True).start()
 
 
 def _append_chat_history(history: list[dict[str, str]], user_text: str, assistant_text: str):
@@ -567,17 +725,44 @@ def _append_chat_history(history: list[dict[str, str]], user_text: str, assistan
     return history
 
 
+def _append_pending_chat_history(history: list[dict[str, str]], user_text: str):
+    return _append_chat_history(history, user_text, PROCESSING_PLACEHOLDER)
+
+
+def _finalize_chat_history(history: list[dict[str, str]], user_text: str, assistant_text: str):
+    if (
+        len(history) >= 2
+        and history[-2].get("role") == "user"
+        and history[-2].get("content") == user_text
+        and history[-1].get("role") == "assistant"
+        and history[-1].get("content") == PROCESSING_PLACEHOLDER
+    ):
+        history[-1] = {"role": "assistant", "content": assistant_text}
+        return history
+    return _append_chat_history(history, user_text, assistant_text)
+
+
 def _empty_history():
     return []
 
 
-def _render_panel(*, kicker: str, title: str, description: str, body: str) -> str:
+def _render_panel(
+    *,
+    kicker: str,
+    title: str,
+    description: str,
+    body: str,
+    body_class: str = "",
+) -> str:
+    classes = "panel-body"
+    if body_class.strip():
+        classes = f"{classes} {body_class.strip()}"
     return f"""
     <section class="panel-shell">
       <div class="panel-kicker">{html.escape(kicker)}</div>
       <h3 class="panel-title">{html.escape(title)}</h3>
       <p class="panel-desc">{html.escape(description)}</p>
-      {body}
+      <div class="{html.escape(classes)}">{body}</div>
     </section>
     """
 
@@ -586,18 +771,7 @@ def _render_hero(app_title: str) -> str:
     return f"""
     <section class="hero-inner">
       <div class="hero-copy">
-        <span class="hero-kicker">Closed-Domain Novel Agent</span>
         <h1 class="hero-title">{html.escape(app_title)}</h1>
-        <p class="hero-subtitle">
-          围绕小说理解、章节压缩与记忆管理构建的封闭式 agent。
-          左侧专注对话，右侧追踪 loop 流程与系统状态，让调试与使用都更顺手。
-        </p>
-      </div>
-      <div class="hero-tags">
-        <span class="hero-tag">小说域对话</span>
-        <span class="hero-tag">章节压缩 Tool</span>
-        <span class="hero-tag">Loop 过程可视化</span>
-        <span class="hero-tag">Markdown Memory</span>
       </div>
     </section>
     """
@@ -625,6 +799,7 @@ def _render_backend_status(status: dict[str, dict[str, Any]]) -> str:
         title="运行状态",
         description="当前决策模型、压缩工具和本地后端的可用状态。",
         body=f'<div class="status-list">{"".join(cards)}</div>',
+        body_class="panel-body-scroll runtime-scroll",
     )
 
 
@@ -671,6 +846,13 @@ def _render_loop_trace(events: list[dict[str, Any]]) -> str:
             items.append(_render_loop_item(f"Step {step_index}", "Observation", f"接收 {tool_name} 返回结果"))
             continue
 
+        if event_type == "decision_review":
+            payload = event.get("payload") or {}
+            verdict = payload.get("verdict", "accept")
+            detail = "首答通过复审" if verdict == "accept" else "首答被要求重试"
+            items.append(_render_loop_item(f"Step {step_index}", "Review", detail))
+            continue
+
         if event_type == "assistant_message":
             items.append(_render_loop_item("Final", "输出", "将最终回复返回到前端", pill_class="done"))
 
@@ -682,6 +864,7 @@ def _render_loop_trace(events: list[dict[str, Any]]) -> str:
         title="模型 Loop 流程",
         description="只展示这一轮里模型做了什么，不展开正文结果。",
         body=f'<div class="loop-list">{"".join(items)}</div>',
+        body_class="panel-body-scroll loop-scroll",
     )
 
 
@@ -718,6 +901,45 @@ def _render_memory_preview(memory_preview: dict[str, list[str]]) -> str:
         title="本轮记忆写入",
         description="这里显示本次对话结束后追加到 daily memory 或 long-term memory 的摘要。",
         body=f'<div class="memory-list">{"".join(blocks)}</div>',
+    )
+
+
+def _render_context_report(report: dict[str, Any] | None) -> str:
+    payload = dict(report or {})
+    rows = [
+        f'<div class="memory-entry">estimated_tokens: {html.escape(str(payload.get("estimated_tokens", 0)))}</div>',
+        f'<div class="memory-entry">pruning_applied: {html.escape(str(bool(payload.get("pruning_applied", False))))}</div>',
+        f'<div class="memory-entry">compaction_applied: {html.escape(str(bool(payload.get("compaction_applied", False))))}</div>',
+        f'<div class="memory-entry">compaction_source: {html.escape(str(payload.get("compaction_source", "") or "(none)"))}</div>',
+        f'<div class="memory-entry">memory_flush_applied: {html.escape(str(bool(payload.get("memory_flush_applied", False))))}</div>',
+        f'<div class="memory-entry">review_triggered: {html.escape(str(bool(payload.get("review_triggered", False))))}</div>',
+        f'<div class="memory-entry">review_verdict: {html.escape(str(payload.get("review_verdict", "") or "(none)"))}</div>',
+    ]
+
+    recall_targets = payload.get("recall_targets") or []
+    if recall_targets:
+        rows.extend(f'<div class="memory-entry">recall: {html.escape(str(item))}</div>' for item in recall_targets)
+
+    context_blocks = payload.get("context_blocks") or []
+    if context_blocks:
+        rows.extend(f'<div class="memory-entry">block: {html.escape(str(item))}</div>' for item in context_blocks)
+
+    if payload.get("memory_flush_daily"):
+        rows.extend(
+            f'<div class="memory-entry">flush_daily: {html.escape(str(item))}</div>'
+            for item in payload.get("memory_flush_daily", [])
+        )
+    if payload.get("memory_flush_long_term"):
+        rows.extend(
+            f'<div class="memory-entry">flush_long_term: {html.escape(str(item))}</div>'
+            for item in payload.get("memory_flush_long_term", [])
+        )
+
+    return _render_panel(
+        kicker="context",
+        title="Context Report",
+        description="展示本轮上下文装配、自动召回、review 与 compact/flush 的摘要。",
+        body=f'<div class="memory-list">{"".join(rows)}</div>',
     )
 
 
@@ -771,6 +993,10 @@ def build_demo(config: AgentConfig | None = None):
     initial_status = _render_backend_status(app.backend_status())
     initial_loop = _render_loop_trace([])
     initial_memory = _render_memory_preview({"daily": [], "long_term": []})
+    app.start_startup_maintenance()
+
+    def prepare_submission(user_message: str):
+        return (user_message or ""), ""
 
     def submit_message(
         user_message: str,
@@ -780,7 +1006,7 @@ def build_demo(config: AgentConfig | None = None):
         history = list(history or [])
         session = session or app.new_session()
         if not user_message or not user_message.strip():
-            return (
+            yield (
                 gr.skip(),
                 gr.skip(),
                 session,
@@ -788,12 +1014,26 @@ def build_demo(config: AgentConfig | None = None):
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
+                "",
             )
+            return
+
+        history = _append_pending_chat_history(history, user_message)
+        yield (
+            _render_chat_html(history),
+            history,
+            session,
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            "",
+        )
 
         outcome = app.handle_chat(session, user_message)
-        history = _append_chat_history(history, user_message, outcome["reply"])
+        history = _finalize_chat_history(history, user_message, outcome["reply"])
 
-        return (
+        yield (
             _render_chat_html(history),
             history,
             outcome["session"],
@@ -801,6 +1041,7 @@ def build_demo(config: AgentConfig | None = None):
             _render_memory_preview(outcome["memory_preview"]),
             outcome["thinking"],
             _render_backend_status(app.backend_status()),
+            "",
         )
 
     def reset_session():
@@ -814,13 +1055,18 @@ def build_demo(config: AgentConfig | None = None):
             _render_memory_preview({"daily": [], "long_term": []}),
             "",
             _render_backend_status(app.backend_status()),
+            "",
         )
 
-    with gr.Blocks(title=app.config.app_title, css=APP_CSS) as demo:
+    with gr.Blocks(title=app.config.app_title) as demo:
         gr.HTML(_render_hero(app.config.app_title), elem_classes="hero-card")
         with gr.Row(elem_classes="layout-row"):
-            with gr.Column(scale=7, elem_classes="main-stack"):
-                chatbot = gr.HTML(value=_render_chat_html(initial_history), elem_classes="chat-card")
+            with gr.Column(scale=8, elem_classes="main-stack"):
+                chatbot = gr.HTML(
+                    value=_render_chat_html(initial_history),
+                    elem_classes="chat-card",
+                    elem_id="chatbot-view",
+                )
                 with gr.Column(elem_classes="composer-card"):
                     gr.HTML(
                         """
@@ -840,7 +1086,7 @@ def build_demo(config: AgentConfig | None = None):
                         send_btn = gr.Button("发送", variant="primary", elem_classes="send-btn")
                         reset_btn = gr.Button("新建会话", elem_classes="ghost-btn")
 
-            with gr.Column(scale=5, elem_classes="side-stack"):
+            with gr.Column(scale=4, elem_classes="side-stack"):
                 backend_status = gr.HTML(value=initial_status, elem_classes="side-card")
                 loop_trace_box = gr.HTML(value=initial_loop, elem_classes="side-card")
                 memory_box = gr.HTML(value=initial_memory, elem_classes="side-card")
@@ -854,19 +1100,44 @@ def build_demo(config: AgentConfig | None = None):
 
         session_state = gr.State(initial_session)
         history_state = gr.State(initial_history)
+        pending_input_state = gr.State("")
 
         submit_event = gr.on(
             triggers=[send_btn.click, user_input.submit],
+            fn=prepare_submission,
+            js=CAPTURE_AND_CLEAR_INPUT_JS,
+            inputs=[user_input],
+            outputs=[pending_input_state, user_input],
+            queue=False,
+            show_progress="hidden",
+        ).then(
             fn=submit_message,
-            inputs=[user_input, history_state, session_state],
-            outputs=[chatbot, history_state, session_state, loop_trace_box, memory_box, thinking_box, backend_status],
+            inputs=[pending_input_state, history_state, session_state],
+            outputs=[
+                chatbot,
+                history_state,
+                session_state,
+                loop_trace_box,
+                memory_box,
+                thinking_box,
+                backend_status,
+                pending_input_state,
+            ],
             show_progress="minimal",
         )
-        submit_event.then(lambda: "", outputs=user_input)
 
         reset_btn.click(
             fn=reset_session,
-            outputs=[chatbot, history_state, session_state, loop_trace_box, memory_box, thinking_box, backend_status],
+            outputs=[
+                chatbot,
+                history_state,
+                session_state,
+                loop_trace_box,
+                memory_box,
+                thinking_box,
+                backend_status,
+                pending_input_state,
+            ],
         )
 
     return demo
@@ -877,4 +1148,34 @@ def main() -> None:
         demo = build_demo()
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = [item.strip() for item in os.getenv(key, "").split(",") if item.strip()]
+        for candidate in ("127.0.0.1", "localhost"):
+            if candidate not in existing:
+                existing.append(candidate)
+        os.environ[key] = ",".join(existing)
+    server_name = os.getenv("GRADIO_SERVER_NAME", "0.0.0.0")
+    server_port_text = os.getenv("GRADIO_SERVER_PORT", "").strip()
+    launch_kwargs: dict[str, Any] = {
+        "server_name": server_name,
+        "css": APP_CSS,
+        "head": APP_HEAD,
+    }
+    if server_port_text:
+        launch_kwargs["server_port"] = int(server_port_text)
+        demo.launch(**launch_kwargs)
+        return
+
+    last_error: Exception | None = None
+    for server_port in DEFAULT_SERVER_PORT_CANDIDATES:
+        try:
+            demo.launch(**launch_kwargs, server_port=server_port)
+            return
+        except OSError as exc:
+            last_error = exc
+            continue
+
+    ports_text = ", ".join(str(port) for port in DEFAULT_SERVER_PORT_CANDIDATES)
+    if last_error is not None:
+        raise SystemExit(f"无法启动服务：候选端口均不可用（{ports_text}）。最后错误：{last_error}") from last_error
+    raise SystemExit(f"无法启动服务：候选端口均不可用（{ports_text}）。")

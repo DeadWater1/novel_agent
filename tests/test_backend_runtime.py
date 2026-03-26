@@ -3,19 +3,24 @@ from novel_agent.backends.decision import _select_model_runtime
 
 
 class StubCuda:
-    def __init__(self, available: bool):
+    def __init__(self, available: bool, bf16_supported: bool = True):
         self._available = available
+        self._bf16_supported = bf16_supported
 
     def is_available(self):
         return self._available
 
+    def is_bf16_supported(self):
+        return self._bf16_supported
+
 
 class StubTorch:
     bfloat16 = "bfloat16"
+    float16 = "float16"
     float32 = "float32"
 
-    def __init__(self, cuda_available: bool):
-        self.cuda = StubCuda(cuda_available)
+    def __init__(self, cuda_available: bool, bf16_supported: bool = True):
+        self.cuda = StubCuda(cuda_available, bf16_supported=bf16_supported)
 
 
 class StubGenerator:
@@ -77,20 +82,28 @@ class RejectsGeneratorModel:
         return "ok"
 
 
-def test_runtime_falls_back_to_cpu_without_accelerate(monkeypatch):
+def test_runtime_uses_single_gpu_without_accelerate(monkeypatch):
     monkeypatch.setattr("novel_agent.backends.decision._has_accelerate", lambda: False)
     runtime = _select_model_runtime(StubTorch(cuda_available=True))
-    assert runtime["device"] == "cpu"
+    assert runtime["device"] == "cuda:0"
     assert runtime["device_map"] is None
-    assert runtime["dtype"] == "float32"
+    assert runtime["dtype"] == "bfloat16"
 
 
 def test_runtime_uses_device_map_when_accelerate_and_cuda_available(monkeypatch):
     monkeypatch.setattr("novel_agent.backends.decision._has_accelerate", lambda: True)
     runtime = _select_model_runtime(StubTorch(cuda_available=True))
-    assert runtime["device"] == "cuda"
+    assert runtime["device"] == "cuda:0"
     assert runtime["device_map"] == "auto"
     assert runtime["dtype"] == "bfloat16"
+
+
+def test_runtime_uses_fp16_when_bf16_is_not_supported(monkeypatch):
+    monkeypatch.setattr("novel_agent.backends.decision._has_accelerate", lambda: False)
+    runtime = _select_model_runtime(StubTorch(cuda_available=True, bf16_supported=False))
+    assert runtime["device"] == "cuda:0"
+    assert runtime["device_map"] is None
+    assert runtime["dtype"] == "float16"
 
 
 def test_build_generator_uses_model_device_and_seed():

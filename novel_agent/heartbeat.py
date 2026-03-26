@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from .compaction import ContextCompactionManager
 from .config import AgentConfig
 from .maintenance import build_daily_memory_candidates, build_long_term_candidates, rebuild_session_summary
 from .memory import SessionState, SessionStore
@@ -16,11 +17,13 @@ class HeartbeatManager:
         session_store: SessionStore,
         meta_store: SessionMetaStore,
         workspace: WorkspaceManager,
+        compaction_manager: ContextCompactionManager | None = None,
     ) -> None:
         self.config = config
         self.session_store = session_store
         self.meta_store = meta_store
         self.workspace = workspace
+        self.compaction_manager = compaction_manager
         self._last_idle_run = 0.0
 
     def run_turn_heartbeat(self, session: SessionState) -> None:
@@ -36,6 +39,7 @@ class HeartbeatManager:
         meta.dirty_summary = True
         meta.dirty_daily_memory = True
         meta.dirty_long_term = True
+        meta.dirty_compaction = self.compaction_manager is not None
         self.meta_store.save(meta)
 
     def maybe_run_idle_heartbeat(self, max_sessions: int | None = None) -> int:
@@ -83,6 +87,11 @@ class HeartbeatManager:
                 )
                 self.workspace.append_long_term_entries(long_term_candidates)
                 meta.dirty_long_term = False
+
+            if meta.dirty_compaction and self.compaction_manager is not None:
+                self.meta_store.save(meta)
+                self.compaction_manager.compact_session(session)
+                meta = self.meta_store.get_or_create(session.session_id)
 
             if new_records:
                 meta.last_memory_turn_index = max(int(record.get("turn_index", 0)) for record in new_records)

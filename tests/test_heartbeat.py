@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from novel_agent.compaction import ContextCompactionManager
 from novel_agent.config import AgentConfig
 from novel_agent.heartbeat import HeartbeatManager
 from novel_agent.memory import SessionStore
@@ -22,17 +23,20 @@ def build_heartbeat(tmp_path: Path, *, long_term_repeat_threshold: int = 2):
     session_store.bootstrap()
     meta_store = SessionMetaStore(config.session_root)
     meta_store.bootstrap()
+    compaction_manager = ContextCompactionManager(config, session_store, meta_store)
+    compaction_manager.bootstrap()
     heartbeat = HeartbeatManager(
         config=config,
         session_store=session_store,
         meta_store=meta_store,
         workspace=workspace,
+        compaction_manager=compaction_manager,
     )
-    return config, workspace, session_store, meta_store, heartbeat
+    return config, workspace, session_store, meta_store, compaction_manager, heartbeat
 
 
 def test_turn_heartbeat_updates_meta_and_cached_summary(tmp_path: Path):
-    _, _, session_store, meta_store, heartbeat = build_heartbeat(tmp_path)
+    _, _, session_store, meta_store, _, heartbeat = build_heartbeat(tmp_path)
     session = session_store.create_session()
     session.add_user_message("请分析这章的人物关系")
     session.add_assistant_message("这里重点是林秋和沈砚的关系变化。")
@@ -44,11 +48,12 @@ def test_turn_heartbeat_updates_meta_and_cached_summary(tmp_path: Path):
     assert meta.dirty_summary is True
     assert meta.dirty_daily_memory is True
     assert meta.dirty_long_term is True
+    assert meta.dirty_compaction is True
     assert "人物关系" in meta.cached_summary
 
 
 def test_idle_heartbeat_writes_memory_and_clears_dirty_flags(tmp_path: Path):
-    _, workspace, session_store, meta_store, heartbeat = build_heartbeat(
+    _, workspace, session_store, meta_store, compaction_manager, heartbeat = build_heartbeat(
         tmp_path,
         long_term_repeat_threshold=1,
     )
@@ -100,10 +105,16 @@ def test_idle_heartbeat_writes_memory_and_clears_dirty_flags(tmp_path: Path):
     assert meta.dirty_summary is False
     assert meta.dirty_daily_memory is False
     assert meta.dirty_long_term is False
+    assert meta.dirty_compaction is False
     assert meta.last_memory_turn_index == 1
+    assert meta.latest_compaction_path.endswith(f"{session.session_id}.json")
+    assert Path(meta.latest_compaction_path).exists()
 
     daily_content = workspace.ensure_daily_file().read_text(encoding="utf-8")
     long_term_content = (workspace.root / "memory.md").read_text(encoding="utf-8")
     assert "今天执行了 1 次章节压缩任务" in daily_content
     assert "用户偏好压缩时保留人物关系" in long_term_content
     assert "用户偏好压缩时保留剧情顺序" in long_term_content
+    artifact = compaction_manager.load_compaction(session.session_id)
+    assert artifact is not None
+    assert artifact.compression_history

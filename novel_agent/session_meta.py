@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 def utc_now_iso() -> str:
@@ -16,10 +17,17 @@ class SessionMeta:
     last_activity_at: str = ""
     last_heartbeat_at: str = ""
     last_memory_turn_index: int = 0
+    last_memory_flush_turn_index: int = 0
+    last_compaction_turn_index: int = 0
     dirty_summary: bool = False
     dirty_daily_memory: bool = False
     dirty_long_term: bool = False
+    dirty_compaction: bool = False
     cached_summary: str = ""
+    cached_compact_summary: str = ""
+    latest_transcript_path: str = ""
+    latest_compaction_path: str = ""
+    recent_content_references: list[dict[str, Any]] = field(default_factory=list)
 
 
 class SessionMetaStore:
@@ -70,6 +78,6 @@ class SessionMetaStore:
     def list_dirty_sessions(self) -> list[SessionMeta]:
         results = []
         for meta in self.list_all():
-            if meta.dirty_summary or meta.dirty_daily_memory or meta.dirty_long_term:
+            if meta.dirty_summary or meta.dirty_daily_memory or meta.dirty_long_term or meta.dirty_compaction:
                 results.append(meta)
         return results
