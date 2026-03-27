@@ -54,11 +54,14 @@ def extract_answer_text(output_text: str) -> str:
 
 
 def split_think_and_answer(tokenizer: Any, output_ids: list[int]) -> tuple[str, str]:
+    decoded = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+    if "<think>" in decoded and "</think>" in decoded:
+        return extract_think_text(decoded), extract_answer_text(decoded)
+
     end_id = get_think_end_token_id(tokenizer)
     try:
         index = len(output_ids) - output_ids[::-1].index(end_id)
     except ValueError:
-        decoded = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
         return "", extract_answer_text(decoded)
     thinking_raw = tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip()
     answer = tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip()

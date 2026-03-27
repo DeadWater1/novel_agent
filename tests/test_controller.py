@@ -6,15 +6,24 @@ from pathlib import Path
 from novel_agent.compaction import ContextCompactionManager, render_compact_summary_text
 from novel_agent.config import AgentConfig
 from novel_agent.controller import ControllerDependencies, NovelAgentController
+from novel_agent.embedding_index import EmbeddingIndexManager
 from novel_agent.memory import SessionState, SessionStore
 from novel_agent.registry import build_default_registry
-from novel_agent.schemas import CompressionResult, DecisionOutput, DecisionReviewOutput, MemoryWrite
+from novel_agent.schemas import (
+    BackendHealth,
+    CompressionResult,
+    DecisionOutput,
+    DecisionReviewOutput,
+    ExecutionPlanOutput,
+    MemoryWrite,
+    PlanStep,
+)
 from novel_agent.session_meta import SessionMetaStore
 from novel_agent.workspace import WorkspaceManager
 
 
 class StubDecisionBackend:
-    def __init__(self, decisions, reviews=None) -> None:
+    def __init__(self, decisions, reviews=None, plans=None) -> None:
         if isinstance(decisions, list):
             self.decisions = list(decisions)
         else:
@@ -25,14 +34,52 @@ class StubDecisionBackend:
             self.reviews = list(reviews)
         else:
             self.reviews = [reviews]
+        if plans is None:
+            inferred_steps = [
+                PlanStep(
+                    step_index=index,
+                    goal=(decision.user_goal or f"step {index}"),
+                    preferred_action=decision.action if decision.action in ("direct_reply", "call_tool") else "direct_reply",
+                    preferred_tool=(
+                        decision.tool_name
+                        if decision.action == "call_tool"
+                        and decision.tool_name in ("compress_chapter", "memory_search", "memory_get", "embedding_similarity")
+                        else None
+                    ),
+                )
+                for index, decision in enumerate(self.decisions, start=1)
+            ]
+            self.plans = [ExecutionPlanOutput(user_goal=self.decisions[0].user_goal or "stub_goal", steps=inferred_steps)]
+        elif isinstance(plans, list):
+            self.plans = list(plans)
+        else:
+            self.plans = [plans]
+        self.plan_calls = 0
         self.calls = 0
         self.review_calls = 0
+        self.last_plan_output_text = ""
         self.last_messages = None
         self.last_workspace_docs = ""
         self.last_session_summary = ""
         self.last_compacted_session_context = ""
         self.last_recent_content_references = ""
         self.last_loop_events = None
+
+    def plan_turn(
+        self,
+        *,
+        user_text,
+        messages,
+        workspace_docs,
+        session_summary,
+        compacted_session_context="",
+        recent_content_references="",
+        loop_events=None,
+    ):
+        self.plan_calls += 1
+        index = min(self.plan_calls - 1, len(self.plans) - 1)
+        self.last_plan_output_text = '{"user_goal":"stub","steps":[]}'
+        return self.plans[index]
 
     def decide(
         self,
@@ -42,6 +89,9 @@ class StubDecisionBackend:
         compacted_session_context="",
         recent_content_references="",
         loop_events=None,
+        execution_plan=None,
+        current_step=None,
+        completed_steps=None,
     ):
         self.calls += 1
         self.last_messages = messages
@@ -62,6 +112,9 @@ class StubDecisionBackend:
         compacted_session_context="",
         recent_content_references="",
         loop_events=None,
+        execution_plan=None,
+        current_step=None,
+        completed_steps=None,
         decision,
         user_text,
     ):
@@ -99,15 +152,68 @@ class StubCompressionBackend:
         return CompressionResult(compressed_text="压缩结果", thinking="调试思考")
 
 
-def build_controller(tmp_path: Path, decisions, reviews=None, **config_overrides):
+class StubEmbeddingBackend:
+    name = "embedding_backend"
+
+    def healthcheck(self) -> BackendHealth:
+        return BackendHealth(ok=True, name=self.name, detail="stub")
+
+    def similarity(self, query: str, text: str) -> float:
+        return self.similarity_batch(query, [text])[0]
+
+    def similarity_batch(self, query: str, texts: list[str]) -> list[float]:
+        clean_query = query.strip()
+        query_chars = set(clean_query)
+        scores: list[float] = []
+        for text in texts:
+            clean_text = text.strip()
+            if not clean_query or not clean_text:
+                scores.append(0.0)
+                continue
+            overlap = len(query_chars & set(clean_text)) / max(len(query_chars), 1)
+            exact_bonus = 1.0 if clean_query in clean_text else 0.0
+            scores.append(overlap + exact_bonus)
+        return scores
+
+    def embed_query(self, query: str):
+        return self.embed_texts([query], prompt_type="query")
+
+    def embed_texts(self, texts: list[str], *, prompt_type: str = "document"):
+        import torch
+
+        vectors = []
+        for text in texts:
+            clean_text = text.strip()
+            if not clean_text:
+                vectors.append([0.0] * 128)
+                continue
+            vector = [0.0] * 128
+            for char in clean_text:
+                vector[ord(char) % 128] += 1.0
+            if prompt_type == "query":
+                vector[0] += 0.5
+            vectors.append(vector)
+        tensor = torch.tensor(vectors, dtype=torch.float32)
+        return torch.nn.functional.normalize(tensor, p=2, dim=1)
+
+
+def build_controller(tmp_path: Path, decisions, reviews=None, plans=None, **config_overrides):
     config = AgentConfig(
         workspace_root=tmp_path / "workspace",
         session_root=tmp_path / "sessions",
+        embedding_index_root=tmp_path / "runtime" / "embeddings",
         show_debug_thinking=True,
-        agent_max_loop_steps=4,
+        agent_max_loop_steps=6,
         **config_overrides,
     )
-    workspace = WorkspaceManager(config)
+    embedding_backend = StubEmbeddingBackend()
+    embedding_index_manager = EmbeddingIndexManager(config, embedding_backend)
+    embedding_index_manager.bootstrap()
+    workspace = WorkspaceManager(
+        config,
+        embedding_backend=embedding_backend,
+        embedding_index_manager=embedding_index_manager,
+    )
     workspace.bootstrap()
     session_store = SessionStore(config.session_root, summary_max_chars=config.session_summary_max_chars)
     session_store.bootstrap()
@@ -119,8 +225,10 @@ def build_controller(tmp_path: Path, decisions, reviews=None, **config_overrides
         config=config,
         workspace=workspace,
         registry=build_default_registry(),
-        decision_backend=StubDecisionBackend(decisions, reviews=reviews),
+        decision_backend=StubDecisionBackend(decisions, reviews=reviews, plans=plans),
         compression_backend=StubCompressionBackend(),
+        embedding_backend=embedding_backend,
+        embedding_index_manager=embedding_index_manager,
         session_store=session_store,
         meta_store=meta_store,
         compaction_manager=compaction_manager,
@@ -227,6 +335,43 @@ def test_model_drives_compress_tool_instead_of_controller_shortcut(tmp_path: Pat
     assert deps.decision_backend.calls == 1
     assert deps.compression_backend.last_request is not None
     assert deps.compression_backend.last_request.raw_text == "这是一章小说原文"
+    assert deps.compression_backend.last_request.enable_thinking is True
+    assert deps.compression_backend.last_request.max_new_tokens == 3584
+
+
+def test_compress_tool_ignores_model_generation_overrides_and_uses_config_defaults(tmp_path: Path):
+    decision = DecisionOutput(
+        domain="novel",
+        action="call_tool",
+        tool_name="compress_chapter",
+        tool_args={
+            "raw_text": "这是一章小说原文",
+            "max_new_tokens": 500,
+            "temperature": 0.9,
+            "seed": 123,
+            "top_p": 0.6,
+            "top_k": 5,
+            "enable_thinking": False,
+        },
+    )
+    controller, deps = build_controller(
+        tmp_path,
+        decision,
+        reviews=DecisionReviewOutput(verdict="accept", reason="tool_call"),
+        compression_temperature=0.33,
+        compression_top_p=0.88,
+        compression_top_k=17,
+        compression_seed=77,
+    )
+    session = SessionState()
+    controller.handle_user_message(session, "请压缩这一章")
+    assert deps.compression_backend.last_request is not None
+    assert deps.compression_backend.last_request.max_new_tokens == 3584
+    assert deps.compression_backend.last_request.temperature == 0.33
+    assert deps.compression_backend.last_request.seed == 77
+    assert deps.compression_backend.last_request.top_p == 0.88
+    assert deps.compression_backend.last_request.top_k == 17
+    assert deps.compression_backend.last_request.enable_thinking is True
 
 
 def test_memory_search_can_happen_before_final_reply(tmp_path: Path):
@@ -285,16 +430,15 @@ def test_direct_reply_review_can_trigger_retry_and_memory_lookup(tmp_path: Path)
     assert "decision_review" in event_types
 
 
-def test_auto_recall_is_injected_into_workspace_docs(tmp_path: Path):
+def test_workspace_docs_no_longer_inject_auto_recall(tmp_path: Path):
     decision = DecisionOutput(domain="novel", action="direct_reply", assistant_reply="沈砚和林秋曾是旧识。")
-    controller, deps = build_controller(tmp_path, decision)
+    controller, deps = build_controller(tmp_path, decision, embedding_index_enabled=False)
     deps.workspace.append_long_term_entries(["沈砚和林秋曾是旧识，后来因为误会分开。"])
 
     session = SessionState()
     controller.handle_user_message(session, "沈砚和林秋是什么关系？")
 
-    assert "# Recalled Memory" in deps.decision_backend.last_workspace_docs
-    assert "沈砚和林秋曾是旧识" in deps.decision_backend.last_workspace_docs
+    assert "# Recalled Memory" not in deps.decision_backend.last_workspace_docs
 
 
 def test_memory_search_uses_compression_ledger_targets_for_lookup(tmp_path: Path):
@@ -348,8 +492,11 @@ def test_lookup_prefers_specific_compression_history_target_over_plain_compact_s
     )
     targets = [str(item["target"]) for item in execution.payload["results"]]
     assert targets
-    assert targets[0].endswith("#compression_history:0")
-    assert f"session_compact:{session.session_id}" not in targets[:1]
+    specific_target = f"session_compact:{session.session_id}#compression_history:0"
+    plain_target = f"session_compact:{session.session_id}"
+    assert specific_target in targets
+    if plain_target in targets:
+        assert targets.index(specific_target) < targets.index(plain_target)
 
 
 def test_memory_get_compression_history_target_returns_full_content(tmp_path: Path):
@@ -375,8 +522,8 @@ def test_memory_get_compression_history_target_returns_full_content(tmp_path: Pa
     )
     assert execution.payload["resolved_target"] == f"session_compact:{session.session_id}#compression_history:0"
     assert execution.payload["content"] == "第一次压缩结果全文，包含完整压缩后的章节内容。"
-    assert execution.terminal is True
-    assert execution.final_reply == "第一次压缩结果全文，包含完整压缩后的章节内容。"
+    assert execution.terminal is False
+    assert execution.final_reply == ""
 
 
 def test_compacted_session_context_uses_index_entries_instead_of_inline_compression_preview(tmp_path: Path):
@@ -400,10 +547,15 @@ def test_compacted_session_context_uses_index_entries_instead_of_inline_compress
     assert f"target=session_compact:{session.session_id}#compression_history:0" in rendered
 
 
-def test_memory_get_default_delivers_full_text_to_user(tmp_path: Path):
+def test_memory_get_default_observes_and_explicit_deliver_returns_full_text_to_user(tmp_path: Path):
     controller, deps = build_controller(
         tmp_path,
-        DecisionOutput(domain="novel", action="call_tool", tool_name="memory_get", tool_args={"target": "placeholder"}),
+        DecisionOutput(
+            domain="novel",
+            action="call_tool",
+            tool_name="memory_get",
+            tool_args={"target": "placeholder", "delivery_mode": "deliver"},
+        ),
     )
     session = deps.session_store.create_session()
     _append_compression_turn(
@@ -421,6 +573,77 @@ def test_memory_get_default_delivers_full_text_to_user(tmp_path: Path):
     assert result.reply == "这是第一次压缩后的完整章节内容。"
     assert result.action == "call_tool"
     assert result.tool_trace["final_tool"] == "memory_get"
+
+
+def test_planner_can_split_multi_step_count_question_into_observe_then_reply(tmp_path: Path):
+    plan = ExecutionPlanOutput(
+        user_goal="询问最近一次压缩输出字数",
+        steps=[
+            PlanStep(step_index=1, goal="读取最近一次压缩输出正文", preferred_action="call_tool", preferred_tool="memory_get"),
+            PlanStep(step_index=2, goal="根据正文返回字数", preferred_action="direct_reply", preferred_tool=None),
+        ],
+    )
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            user_goal="询问最近一次压缩输出字数",
+            action="call_tool",
+            step_index=1,
+            tool_name="memory_get",
+            tool_args={"target": "placeholder"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            user_goal="询问最近一次压缩输出字数",
+            action="direct_reply",
+            step_index=2,
+            assistant_reply="最近一次压缩输出共 14 个字。",
+        ),
+    ]
+    controller, deps = build_controller(tmp_path, decisions, plans=plan)
+    session = deps.session_store.create_session()
+    _append_compression_turn(
+        deps,
+        session,
+        turn_index=1,
+        user_content="请压缩第一章原文",
+        assistant_content="压缩结果一共十四字",
+    )
+    reloaded = deps.session_store.load_session(session.session_id)
+    assert reloaded is not None
+    deps.decision_backend.decisions[0].tool_args["target"] = f"session_compact:{session.session_id}#compression_history:0"
+
+    result = controller.handle_user_message(reloaded, "最近一次的压缩输出总共有多少个字？")
+    assert deps.decision_backend.plan_calls == 1
+    assert deps.decision_backend.calls == 2
+    assert result.reply == "最近一次压缩输出共 14 个字。"
+    assert result.action == "call_tool"
+    assert result.tool_trace["steps"][0]["requested_tool"] == "memory_get"
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert "plan_created" in event_types
+    assert "plan_step_completed" in event_types
+
+
+def test_embedding_similarity_tool_is_available_to_model(tmp_path: Path):
+    controller, _ = build_controller(
+        tmp_path,
+        DecisionOutput(domain="novel", action="direct_reply", assistant_reply="unused"),
+    )
+    session = SessionState()
+    execution = controller._execute_tool(
+        session,
+        "embedding_similarity",
+        {
+            "query": "人物关系",
+            "texts": ["人物关系很复杂", "今天去看天气预报"],
+            "top_k": 1,
+        },
+    )
+    assert execution.tool_name == "embedding_similarity"
+    assert execution.terminal is False
+    assert execution.payload["items"]
+    assert execution.payload["items"][0]["text"] == "人物关系很复杂"
+    assert "score=" in execution.observation_text
 
 
 def test_memory_get_observe_only_feeds_excerpt_back_to_model(tmp_path: Path):
@@ -459,7 +682,12 @@ def test_memory_get_observe_only_feeds_excerpt_back_to_model(tmp_path: Path):
 
 def test_recent_content_reference_alias_is_available_to_model_and_memory_get(tmp_path: Path):
     decisions = [
-        DecisionOutput(domain="novel", action="call_tool", tool_name="memory_get", tool_args={"target": "placeholder"}),
+        DecisionOutput(
+            domain="novel",
+            action="call_tool",
+            tool_name="memory_get",
+            tool_args={"target": "placeholder", "delivery_mode": "deliver"},
+        ),
         DecisionOutput(domain="novel", action="direct_reply", assistant_reply="我已经看到最近内容引用。"),
     ]
     controller, deps = build_controller(tmp_path, decisions)
@@ -482,7 +710,11 @@ def test_recent_content_reference_alias_is_available_to_model_and_memory_get(tmp
     assert second_result.reply == "我已经看到最近内容引用。"
     assert "content_ref:latest" in deps.decision_backend.last_recent_content_references
 
-    execution = controller._execute_tool(reloaded, "memory_get", {"target": "content_ref:latest"})
+    execution = controller._execute_tool(
+        reloaded,
+        "memory_get",
+        {"target": "content_ref:latest", "delivery_mode": "deliver"},
+    )
     assert execution.final_reply == "这是第一次压缩后的完整章节内容。"
 
 
@@ -490,6 +722,8 @@ def test_agent_config_defaults_use_32k_input_budget():
     config = AgentConfig()
     assert config.decision_input_token_budget == 32768
     assert config.decision_output_max_new_tokens == 4096
+    assert config.compression_max_new_tokens == 3584
+    assert config.compression_answer_reserved_tokens == 1536
     assert config.context_memory_flush_soft_threshold == 28672
     assert config.context_pruning_soft_budget == 30720
     assert config.context_auto_compact_token_threshold == 31744

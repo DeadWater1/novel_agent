@@ -4,20 +4,50 @@ from pathlib import Path
 
 from novel_agent.compaction import ContextCompactionManager
 from novel_agent.config import AgentConfig
+from novel_agent.embedding_index import EmbeddingIndexManager
 from novel_agent.heartbeat import HeartbeatManager
 from novel_agent.memory import SessionStore
+from novel_agent.schemas import BackendHealth
 from novel_agent.session_meta import SessionMetaStore
 from novel_agent.workspace import WorkspaceManager
+
+
+class StubEmbeddingBackend:
+    name = "embedding_backend"
+
+    def healthcheck(self) -> BackendHealth:
+        return BackendHealth(ok=True, name=self.name, detail="stub")
+
+    def embed_query(self, query: str):
+        return self.embed_texts([query], prompt_type="query")
+
+    def embed_texts(self, texts: list[str], *, prompt_type: str = "document"):
+        import torch
+
+        values = []
+        for text in texts:
+            clean = text.strip()
+            score = float(len(clean)) or 1.0
+            values.append([score, 1.0])
+        return torch.tensor(values, dtype=torch.float32)
 
 
 def build_heartbeat(tmp_path: Path, *, long_term_repeat_threshold: int = 2):
     config = AgentConfig(
         workspace_root=tmp_path / "workspace",
         session_root=tmp_path / "sessions",
+        embedding_index_root=tmp_path / "runtime" / "embeddings",
         idle_heartbeat_interval_seconds=0,
         long_term_repeat_threshold=long_term_repeat_threshold,
     )
-    workspace = WorkspaceManager(config)
+    embedding_backend = StubEmbeddingBackend()
+    embedding_index_manager = EmbeddingIndexManager(config, embedding_backend)
+    embedding_index_manager.bootstrap()
+    workspace = WorkspaceManager(
+        config,
+        embedding_backend=embedding_backend,
+        embedding_index_manager=embedding_index_manager,
+    )
     workspace.bootstrap()
     session_store = SessionStore(config.session_root, summary_max_chars=config.session_summary_max_chars)
     session_store.bootstrap()
@@ -31,12 +61,13 @@ def build_heartbeat(tmp_path: Path, *, long_term_repeat_threshold: int = 2):
         meta_store=meta_store,
         workspace=workspace,
         compaction_manager=compaction_manager,
+        embedding_index_manager=embedding_index_manager,
     )
-    return config, workspace, session_store, meta_store, compaction_manager, heartbeat
+    return config, workspace, session_store, meta_store, compaction_manager, embedding_index_manager, heartbeat
 
 
 def test_turn_heartbeat_updates_meta_and_cached_summary(tmp_path: Path):
-    _, _, session_store, meta_store, _, heartbeat = build_heartbeat(tmp_path)
+    _, _, session_store, meta_store, _, _, heartbeat = build_heartbeat(tmp_path)
     session = session_store.create_session()
     session.add_user_message("请分析这章的人物关系")
     session.add_assistant_message("这里重点是林秋和沈砚的关系变化。")
@@ -49,11 +80,12 @@ def test_turn_heartbeat_updates_meta_and_cached_summary(tmp_path: Path):
     assert meta.dirty_daily_memory is True
     assert meta.dirty_long_term is True
     assert meta.dirty_compaction is True
+    assert meta.dirty_embedding is True
     assert "人物关系" in meta.cached_summary
 
 
 def test_idle_heartbeat_writes_memory_and_clears_dirty_flags(tmp_path: Path):
-    _, workspace, session_store, meta_store, compaction_manager, heartbeat = build_heartbeat(
+    _, workspace, session_store, meta_store, compaction_manager, embedding_index_manager, heartbeat = build_heartbeat(
         tmp_path,
         long_term_repeat_threshold=1,
     )
@@ -106,9 +138,15 @@ def test_idle_heartbeat_writes_memory_and_clears_dirty_flags(tmp_path: Path):
     assert meta.dirty_daily_memory is False
     assert meta.dirty_long_term is False
     assert meta.dirty_compaction is False
+    assert meta.dirty_embedding is False
     assert meta.last_memory_turn_index == 1
     assert meta.latest_compaction_path.endswith(f"{session.session_id}.json")
     assert Path(meta.latest_compaction_path).exists()
+    assert meta.latest_session_embedding_path.endswith(f"{session.session_id}.pt")
+    assert Path(meta.latest_session_embedding_path).exists()
+    assert meta.latest_compaction_embedding_path.endswith(f"{session.session_id}.pt")
+    assert Path(meta.latest_compaction_embedding_path).exists()
+    assert embedding_index_manager.workspace_shard_path().exists()
 
     daily_content = workspace.ensure_daily_file().read_text(encoding="utf-8")
     long_term_content = (workspace.root / "memory.md").read_text(encoding="utf-8")

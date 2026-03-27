@@ -103,17 +103,17 @@ class SessionStore:
         session = SessionState(session_id=session_id)
         records = self.load_events(session_id)
         if records and any("event_type" in record for record in records):
+            turn_records = self._group_turn_records(records)
+            for payload in turn_records:
+                user_message = str(payload.get("user_message", "")).strip()
+                assistant_reply = str(payload.get("assistant_reply", "")).strip()
+                if user_message:
+                    session.add_user_message(user_message)
+                if assistant_reply:
+                    session.add_assistant_message(assistant_reply)
             for payload in records:
                 event_type = str(payload.get("event_type", ""))
-                if event_type == "user_message":
-                    content = str(payload.get("content", "")).strip()
-                    if content:
-                        session.add_user_message(content)
-                elif event_type == "assistant_message":
-                    content = str(payload.get("content", "")).strip()
-                    if content:
-                        session.add_assistant_message(content)
-                elif event_type == "agent_decision":
+                if event_type == "agent_decision":
                     session.last_decision = payload.get("payload") or None
                 elif event_type == "tool_result":
                     tool_trace = payload.get("payload", {}).get("tool_trace")
@@ -155,7 +155,9 @@ class SessionStore:
             return []
         if not any("event_type" in event for event in events):
             return events
+        return self._group_turn_records(events)
 
+    def _group_turn_records(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         grouped: dict[int, dict[str, Any]] = {}
         for payload in events:
             turn_index = int(payload.get("turn_index", 0))
@@ -171,6 +173,7 @@ class SessionStore:
                     "decision": {},
                     "tool_trace": {},
                     "timestamp": "",
+                    "_prefer_tool_reply": False,
                 },
             )
             event_type = str(payload.get("event_type", ""))
@@ -179,8 +182,6 @@ class SessionStore:
                 current["timestamp"] = timestamp
             if event_type == "user_message":
                 current["user_message"] = str(payload.get("content", "")).strip()
-            elif event_type == "assistant_message":
-                current["assistant_reply"] = str(payload.get("content", "")).strip()
             elif event_type == "agent_decision":
                 decision = payload.get("payload") or {}
                 current["decision"] = decision
@@ -195,9 +196,34 @@ class SessionStore:
                 }
             elif event_type == "tool_result":
                 current["action"] = "call_tool"
-                current["tool_trace"] = (payload.get("payload") or {}).get("tool_trace", current["tool_trace"])
+                envelope = payload.get("payload") or {}
+                current["tool_trace"] = envelope.get("tool_trace", current["tool_trace"])
+                compressed_text = self._extract_compress_chapter_reply(payload)
+                if compressed_text:
+                    current["assistant_reply"] = compressed_text
+                    current["_prefer_tool_reply"] = True
+            elif event_type == "assistant_message":
+                content = str(payload.get("content", "")).strip()
+                if content and not current.get("_prefer_tool_reply"):
+                    current["assistant_reply"] = content
 
-        return [grouped[key] for key in sorted(grouped)]
+        results: list[dict[str, Any]] = []
+        for key in sorted(grouped):
+            item = dict(grouped[key])
+            item.pop("_prefer_tool_reply", None)
+            results.append(item)
+        return results
+
+    def _extract_compress_chapter_reply(self, payload: dict[str, Any]) -> str:
+        if str(payload.get("tool_name", "")).strip() != "compress_chapter":
+            return ""
+        envelope = payload.get("payload") or {}
+        tool_trace = envelope.get("tool_trace") or {}
+        requested_tool = str(tool_trace.get("requested_tool") or payload.get("tool_name") or "").strip()
+        if requested_tool != "compress_chapter":
+            return ""
+        tool_payload = envelope.get("payload") or {}
+        return str(tool_payload.get("compressed_text", "")).strip()
 
     def load_latest_session(self) -> SessionState | None:
         self.bootstrap()

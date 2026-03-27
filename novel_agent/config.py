@@ -10,7 +10,9 @@ DEFAULT_RUNTIME_ROOT = DEFAULT_ROOT / "runtime"
 DEFAULT_SESSION_ROOT = DEFAULT_ROOT / "runtime" / "sessions"
 DEFAULT_TRANSCRIPT_ROOT = DEFAULT_RUNTIME_ROOT / "transcripts"
 DEFAULT_COMPACTION_ROOT = DEFAULT_RUNTIME_ROOT / "compactions"
+DEFAULT_EMBEDDING_INDEX_ROOT = DEFAULT_RUNTIME_ROOT / "embeddings"
 DEFAULT_DECISION_MODEL_PATH = Path("/home/ubuntu/code/qwen/Qwen/Qwen3-14B")
+DEFAULT_EMBEDDING_MODEL_PATH = Path("/home/ubuntu/code/qwen/Qwen/Qwen3-Embedding-0.6B")
 DEFAULT_COMPRESSION_MODEL_PATH = Path("/home/ubuntu/code/qwen/output/Qwen3-4B_cot_beta_4/checkpoint-1334")
 DEFAULT_SUMMARY_MODEL_PATH = DEFAULT_DECISION_MODEL_PATH
 DEFAULT_DECISION_OUTPUT_MAX_NEW_TOKENS = 4096
@@ -23,7 +25,9 @@ class AgentConfig:
     session_root: Path = DEFAULT_SESSION_ROOT
     transcript_root: Path = DEFAULT_TRANSCRIPT_ROOT
     compaction_root: Path = DEFAULT_COMPACTION_ROOT
+    embedding_index_root: Path = DEFAULT_EMBEDDING_INDEX_ROOT
     decision_model_path: Path = DEFAULT_DECISION_MODEL_PATH
+    embedding_model_path: Path = DEFAULT_EMBEDDING_MODEL_PATH
     summary_model_path: Path = DEFAULT_SUMMARY_MODEL_PATH
     compression_model_path: Path = DEFAULT_COMPRESSION_MODEL_PATH
     show_debug_thinking: bool = False
@@ -39,10 +43,12 @@ class AgentConfig:
     summary_top_p: float = 0.9
     summary_top_k: int = 20
     summary_enable_thinking: bool = False
-    compression_max_new_tokens: int = 2800
+    compression_max_new_tokens: int = 3584
+    compression_answer_reserved_tokens: int = 1536
     compression_temperature: float = 0.2
     compression_top_p: float = 0.95
     compression_top_k: int = 20
+    compression_enable_thinking: bool = True
     compression_seed: int | None = None
     daily_memory_lookback_days: int = 2
     recent_message_limit: int = 8
@@ -61,20 +67,25 @@ class AgentConfig:
     context_memory_flush_soft_threshold: int = DEFAULT_CONTEXT_MEMORY_FLUSH_SOFT_THRESHOLD
     memory_flush_soft_threshold_tokens: int = DEFAULT_CONTEXT_MEMORY_FLUSH_SOFT_THRESHOLD
     session_summary_max_chars: int = 1200
-    agent_max_loop_steps: int = 4
+    agent_max_loop_steps: int = 6
     memory_search_max_results: int = 5
     archive_session_search_limit: int = 8
     archive_session_search_messages_per_session: int = 24
     memory_tool_max_chars: int = 4000
+    embedding_max_length: int = 32768
+    embedding_batch_size: int = 16
+    embedding_index_enabled: bool = True
+    embedding_index_batch_size: int = 32
+    embedding_index_max_sessions_per_idle_run: int = 8
     long_term_memory_header: str = "# Long-Term Memory\n\n"
-    app_title: str = "Novel Agent V3"
+    app_title: str = "Novel Agent V4"
     out_of_scope_reply: str = "无法回答"
     enable_heartbeat: bool = True
     idle_heartbeat_interval_seconds: int = 180
     daily_memory_min_turns: int = 1
     long_term_repeat_threshold: int = 2
     tool_registry_enabled: tuple[str, ...] = field(
-        default_factory=lambda: ("compress_chapter", "memory_search", "memory_get")
+        default_factory=lambda: ("compress_chapter", "memory_search", "memory_get", "embedding_similarity")
     )
 
     def __post_init__(self) -> None:
@@ -110,3 +121,8 @@ class AgentConfig:
             self.context_pruning_target_tokens,
         )
         self.memory_flush_soft_threshold_tokens = self.context_memory_flush_soft_threshold
+        self.compression_max_new_tokens = max(self.compression_max_new_tokens, 1)
+        self.compression_answer_reserved_tokens = min(
+            max(self.compression_answer_reserved_tokens, 1),
+            self.compression_max_new_tokens,
+        )

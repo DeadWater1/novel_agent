@@ -6,7 +6,7 @@ from typing import Any
 
 from ..config import AgentConfig
 from ..schemas import BackendHealth, CompressionRequest, CompressionResult
-from ..utils import resolve_seed, split_think_and_answer
+from ..utils import get_think_end_token_id, resolve_seed, split_think_and_answer
 from .base import BaseBackend
 from .decision import _import_llm_dependencies, _load_model_with_runtime, _model_device
 
@@ -90,13 +90,24 @@ class LocalCompressionBackend(BaseBackend):
             "top_k": request.top_k,
             "do_sample": bool(request.temperature > 0),
         }
-        generated_ids = _generate_with_sampling_seed(
-            self._torch,
-            self._model,
-            model_inputs,
-            generation_kwargs,
-            seed,
-        )
+        if request.enable_thinking:
+            generated_ids = _generate_with_answer_reserve(
+                self._torch,
+                self._model,
+                self._tokenizer,
+                model_inputs,
+                generation_kwargs,
+                seed,
+                reserved_answer_tokens=self.config.compression_answer_reserved_tokens,
+            )
+        else:
+            generated_ids = _generate_with_sampling_seed(
+                self._torch,
+                self._model,
+                model_inputs,
+                generation_kwargs,
+                seed,
+            )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
         thinking, answer = split_think_and_answer(self._tokenizer, output_ids)
         return CompressionResult(compressed_text=answer, thinking=thinking)
@@ -138,6 +149,83 @@ def _generate_with_sampling_seed(
     fallback_kwargs = dict(generation_kwargs)
     with _seeded_generation_context(torch_module, model, seed):
         return model.generate(**model_inputs, **fallback_kwargs)
+
+
+def _generate_with_answer_reserve(
+    torch_module: Any,
+    model: Any,
+    tokenizer: Any,
+    model_inputs: Any,
+    generation_kwargs: dict[str, Any],
+    seed: int,
+    *,
+    reserved_answer_tokens: int,
+):
+    total_budget = max(int(generation_kwargs.get("max_new_tokens") or 0), 1)
+    answer_budget = min(max(int(reserved_answer_tokens), 1), total_budget)
+    thinking_budget = total_budget - answer_budget
+    if thinking_budget <= 0:
+        return _generate_with_sampling_seed(
+            torch_module,
+            model,
+            model_inputs,
+            generation_kwargs,
+            seed,
+        )
+
+    think_end_id = get_think_end_token_id(tokenizer)
+    thinking_kwargs = dict(generation_kwargs)
+    thinking_kwargs["max_new_tokens"] = thinking_budget
+    thinking_kwargs["eos_token_id"] = think_end_id
+    thinking_stage = _generate_with_sampling_seed(
+        torch_module,
+        model,
+        model_inputs,
+        thinking_kwargs,
+        seed,
+    )
+
+    prompt_length = int(model_inputs.input_ids.shape[1])
+    thinking_output_ids = thinking_stage[0][prompt_length:].tolist()
+    if think_end_id not in thinking_output_ids:
+        thinking_stage = _append_forced_think_close(
+            torch_module,
+            tokenizer,
+            thinking_stage,
+            think_end_id,
+        )
+
+    answer_inputs = {
+        "input_ids": thinking_stage,
+        "attention_mask": torch_module.ones_like(thinking_stage),
+    }
+    answer_kwargs = dict(generation_kwargs)
+    answer_kwargs["max_new_tokens"] = answer_budget
+    answer_kwargs.pop("eos_token_id", None)
+    return _generate_with_sampling_seed(
+        torch_module,
+        model,
+        answer_inputs,
+        answer_kwargs,
+        seed,
+    )
+
+
+def _append_forced_think_close(torch_module: Any, tokenizer: Any, token_ids: Any, think_end_id: int):
+    closing_ids = _forced_think_close_ids(tokenizer, think_end_id)
+    closing_tensor = torch_module.tensor([closing_ids], dtype=token_ids.dtype, device=token_ids.device)
+    return torch_module.cat([token_ids, closing_tensor], dim=1)
+
+
+def _forced_think_close_ids(tokenizer: Any, think_end_id: int) -> list[int]:
+    try:
+        encoded = tokenizer.encode("</think>\n\n", add_special_tokens=False)
+    except Exception:
+        encoded = []
+    cleaned = [int(token_id) for token_id in encoded if token_id is not None]
+    if not cleaned or think_end_id not in cleaned:
+        return [int(think_end_id)]
+    return cleaned
 
 
 def _is_unsupported_generator_error(exc: Exception) -> bool:

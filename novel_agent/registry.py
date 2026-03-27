@@ -52,4 +52,11 @@ def build_default_registry() -> ToolRegistry:
             required_args=("target",),
         )
     )
+    registry.register(
+        ToolSpec(
+            name="embedding_similarity",
+            description="Compute semantic similarity scores between a query and one or more texts with the local embedding model.",
+            required_args=("query",),
+        )
+    )
     return registry

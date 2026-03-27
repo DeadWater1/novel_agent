@@ -87,3 +87,35 @@ def test_session_store_restores_session_from_event_transcript(tmp_path: Path):
     assert restored.last_tool_trace == {"requested_tool": "memory_search", "status": "ok"}
     assert restored.last_thinking == "调试信息"
     assert "用户: 林秋出场" in restored.summary
+
+
+def test_session_store_prefers_compress_tool_payload_when_replaying_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions", summary_max_chars=300)
+    session = store.create_session()
+    store.append_events(
+        session,
+        [
+            {"turn_index": 1, "event_type": "user_message", "role": "user", "content": "请压缩这段原文"},
+            {
+                "turn_index": 1,
+                "event_type": "tool_result",
+                "tool_name": "compress_chapter",
+                "content": "这是一段被污染的旧回复",
+                "payload": {
+                    "tool_trace": {"requested_tool": "compress_chapter", "status": "ok"},
+                    "payload": {"compressed_text": "这是可靠的压缩结果"},
+                },
+            },
+            {"turn_index": 1, "event_type": "assistant_message", "role": "assistant", "content": "这是一段被污染的旧回复"},
+        ],
+    )
+
+    restored = store.load_session(session.session_id)
+    assert restored is not None
+    assert restored.chat_history() == [
+        {"role": "user", "content": "请压缩这段原文"},
+        {"role": "assistant", "content": "这是可靠的压缩结果"},
+    ]
+
+    turn_records = store.load_turn_records(session.session_id)
+    assert turn_records[0]["assistant_reply"] == "这是可靠的压缩结果"

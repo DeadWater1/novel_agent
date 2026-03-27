@@ -6,10 +6,11 @@ import threading
 import time
 from typing import Any
 
-from .backends import LocalCompressionBackend, LocalDecisionBackend, LocalSummaryBackend
+from .backends import LocalCompressionBackend, LocalDecisionBackend, LocalEmbeddingBackend, LocalSummaryBackend
 from .compaction import ContextCompactionManager
 from .config import AgentConfig
 from .controller import ControllerDependencies, NovelAgentController
+from .embedding_index import EmbeddingIndexManager
 from .heartbeat import HeartbeatManager
 from .memory import SessionState, SessionStore
 from .registry import build_default_registry
@@ -359,12 +360,17 @@ body,
 }
 
 .runtime-scroll {
-  max-height: 280px;
+  max-height: 220px;
   padding-right: 4px;
 }
 
 .loop-scroll {
-  max-height: 420px;
+  max-height: 320px;
+  padding-right: 4px;
+}
+
+.decision-scroll {
+  max-height: 260px;
   padding-right: 4px;
 }
 
@@ -500,11 +506,15 @@ body,
   }
 
   .runtime-scroll {
-    max-height: 250px;
+    max-height: 200px;
   }
 
   .loop-scroll {
-    max-height: 360px;
+    max-height: 280px;
+  }
+
+  .decision-scroll {
+    max-height: 240px;
   }
 }
 
@@ -537,11 +547,15 @@ body,
   }
 
   .runtime-scroll {
-    max-height: 220px;
+    max-height: 180px;
   }
 
   .loop-scroll {
-    max-height: 300px;
+    max-height: 260px;
+  }
+
+  .decision-scroll {
+    max-height: 220px;
   }
 }
 """
@@ -627,7 +641,14 @@ def _import_gradio() -> Any:
 class NovelAgentApplication:
     def __init__(self, config: AgentConfig | None = None) -> None:
         self.config = config or AgentConfig()
-        self.workspace = WorkspaceManager(self.config)
+        self.embedding_backend = LocalEmbeddingBackend(self.config)
+        self.embedding_index_manager = EmbeddingIndexManager(self.config, self.embedding_backend)
+        self.embedding_index_manager.bootstrap()
+        self.workspace = WorkspaceManager(
+            self.config,
+            embedding_backend=self.embedding_backend,
+            embedding_index_manager=self.embedding_index_manager,
+        )
         self.workspace.bootstrap()
         self.session_store = SessionStore(self.config.session_root, summary_max_chars=self.config.session_summary_max_chars)
         self.session_store.bootstrap()
@@ -651,6 +672,8 @@ class NovelAgentApplication:
                 registry=self.registry,
                 decision_backend=self.decision_backend,
                 compression_backend=self.compression_backend,
+                embedding_backend=self.embedding_backend,
+                embedding_index_manager=self.embedding_index_manager,
                 session_store=self.session_store,
                 meta_store=self.meta_store,
                 compaction_manager=self.compaction_manager,
@@ -662,6 +685,7 @@ class NovelAgentApplication:
             meta_store=self.meta_store,
             workspace=self.workspace,
             compaction_manager=self.compaction_manager,
+            embedding_index_manager=self.embedding_index_manager,
         )
         self._startup_maintenance_started = False
 
@@ -681,10 +705,12 @@ class NovelAgentApplication:
 
     def backend_status(self) -> dict[str, dict[str, Any]]:
         decision = self.decision_backend.healthcheck().model_dump()
+        embedding = self.embedding_backend.healthcheck().model_dump()
         compression = self.compression_backend.healthcheck().model_dump()
         summary = self.summary_backend.healthcheck().model_dump()
         return {
             "decision_backend": decision,
+            "embedding_backend": embedding,
             "compression_backend": compression,
             "summary_backend": summary,
         }
@@ -698,6 +724,9 @@ class NovelAgentApplication:
             "reply": result.reply,
             "transcript_events": result.transcript_events,
             "thinking": result.thinking if self.config.show_debug_thinking else "",
+            "plan_output_text": str(getattr(self.decision_backend, "last_plan_output_text", "") or ""),
+            "decision_output_text": str(getattr(self.decision_backend, "last_decision_output_text", "") or ""),
+            "review_output_text": str(getattr(self.decision_backend, "last_review_output_text", "") or ""),
             "memory_preview": result.memory_preview,
             "context_report": result.context_report,
             "session": session,
@@ -821,6 +850,25 @@ def _render_loop_trace(events: list[dict[str, Any]]) -> str:
         event_type = event.get("event_type")
         step_index = event.get("step_index", "?")
 
+        if event_type == "plan_created":
+            items.append(_render_loop_item("Plan", "Plan Created", "生成本轮执行计划"))
+            continue
+
+        if event_type == "plan_updated":
+            items.append(_render_loop_item(f"Step {step_index}", "Plan Updated", "执行中更新剩余计划"))
+            continue
+
+        if event_type == "plan_update_ignored":
+            items.append(_render_loop_item(f"Step {step_index}", "Plan Update Ignored", "本轮重规划次数已用尽"))
+            continue
+
+        if event_type == "plan_step_completed":
+            payload = event.get("payload") or {}
+            goal = payload.get("goal", "") or event.get("goal", "")
+            detail = f"完成 step：{goal}" if goal else "完成当前 step"
+            items.append(_render_loop_item(f"Step {step_index}", "Step Completed", detail))
+            continue
+
         if event_type == "agent_decision":
             payload = event.get("payload") or {}
             action = payload.get("action", "")
@@ -865,6 +913,58 @@ def _render_loop_trace(events: list[dict[str, Any]]) -> str:
         description="只展示这一轮里模型做了什么，不展开正文结果。",
         body=f'<div class="loop-list">{"".join(items)}</div>',
         body_class="panel-body-scroll loop-scroll",
+    )
+
+
+def _render_decision_output(
+    plan_output_text: str = "",
+    decision_output_text: str = "",
+    review_output_text: str = "",
+) -> str:
+    blocks: list[str] = []
+    clean_plan = plan_output_text.strip()
+    clean_decision = decision_output_text.strip()
+    clean_review = review_output_text.strip()
+
+    if clean_plan:
+        blocks.append(
+            """
+            <div class="memory-block">
+              <span class="memory-section-label">Planner Output</span>
+            """
+            + f'<div class="memory-entry">{html.escape(clean_plan).replace(chr(10), "<br>")}</div>'
+            + "</div>"
+        )
+
+    if clean_decision:
+        blocks.append(
+            """
+            <div class="memory-block">
+              <span class="memory-section-label">Decision Output</span>
+            """
+            + f'<div class="memory-entry">{html.escape(clean_decision).replace(chr(10), "<br>")}</div>'
+            + "</div>"
+        )
+
+    if clean_review:
+        blocks.append(
+            """
+            <div class="memory-block">
+              <span class="memory-section-label">Review Output</span>
+            """
+            + f'<div class="memory-entry">{html.escape(clean_review).replace(chr(10), "<br>")}</div>'
+            + "</div>"
+        )
+
+    if not blocks:
+        blocks.append('<div class="empty-note">当前没有可显示的决策模型原始输出。</div>')
+
+    return _render_panel(
+        kicker="decision",
+        title="决策模型输出",
+        description="展示 planner、决策模型与复审模型本轮的原始输出文本。",
+        body=f'<div class="memory-list">{"".join(blocks)}</div>',
+        body_class="panel-body-scroll decision-scroll",
     )
 
 
@@ -992,7 +1092,7 @@ def build_demo(config: AgentConfig | None = None):
     initial_history = initial_session.chat_history()
     initial_status = _render_backend_status(app.backend_status())
     initial_loop = _render_loop_trace([])
-    initial_memory = _render_memory_preview({"daily": [], "long_term": []})
+    initial_decision_output = _render_decision_output()
     app.start_startup_maintenance()
 
     def prepare_submission(user_message: str):
@@ -1013,7 +1113,6 @@ def build_demo(config: AgentConfig | None = None):
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
-                gr.skip(),
                 "",
             )
             return
@@ -1023,7 +1122,6 @@ def build_demo(config: AgentConfig | None = None):
             _render_chat_html(history),
             history,
             session,
-            gr.skip(),
             gr.skip(),
             gr.skip(),
             gr.skip(),
@@ -1038,8 +1136,11 @@ def build_demo(config: AgentConfig | None = None):
             history,
             outcome["session"],
             _render_loop_trace(outcome["transcript_events"]),
-            _render_memory_preview(outcome["memory_preview"]),
-            outcome["thinking"],
+            _render_decision_output(
+                outcome["plan_output_text"],
+                outcome["decision_output_text"],
+                outcome["review_output_text"],
+            ),
             _render_backend_status(app.backend_status()),
             "",
         )
@@ -1052,8 +1153,7 @@ def build_demo(config: AgentConfig | None = None):
             history,
             session,
             _render_loop_trace([]),
-            _render_memory_preview({"daily": [], "long_term": []}),
-            "",
+            _render_decision_output(),
             _render_backend_status(app.backend_status()),
             "",
         )
@@ -1089,14 +1189,7 @@ def build_demo(config: AgentConfig | None = None):
             with gr.Column(scale=4, elem_classes="side-stack"):
                 backend_status = gr.HTML(value=initial_status, elem_classes="side-card")
                 loop_trace_box = gr.HTML(value=initial_loop, elem_classes="side-card")
-                memory_box = gr.HTML(value=initial_memory, elem_classes="side-card")
-                thinking_box = gr.Textbox(
-                    label="Thinking（调试）",
-                    visible=app.config.show_debug_thinking,
-                    lines=8,
-                    interactive=False,
-                    elem_classes="thinking-card",
-                )
+                decision_output_box = gr.HTML(value=initial_decision_output, elem_classes="side-card")
 
         session_state = gr.State(initial_session)
         history_state = gr.State(initial_history)
@@ -1118,8 +1211,7 @@ def build_demo(config: AgentConfig | None = None):
                 history_state,
                 session_state,
                 loop_trace_box,
-                memory_box,
-                thinking_box,
+                decision_output_box,
                 backend_status,
                 pending_input_state,
             ],
@@ -1133,8 +1225,7 @@ def build_demo(config: AgentConfig | None = None):
                 history_state,
                 session_state,
                 loop_trace_box,
-                memory_box,
-                thinking_box,
+                decision_output_box,
                 backend_status,
                 pending_input_state,
             ],

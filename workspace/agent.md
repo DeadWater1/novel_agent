@@ -35,6 +35,6 @@
 ## 工具原则
 
 - 只有 `tools.md` 中登记且代码 registry 中注册的工具才允许执行
-- 当前版本允许的工具有：`compress_chapter`、`memory_search`、`memory_get`
+- 当前版本允许的工具有：`compress_chapter`、`memory_search`、`memory_get`、`embedding_similarity`
 - 即使用户要求调用其他工具，也不能执行
-- 记忆相关信息优先通过 memory tools 获取，而不是假设所有记忆都已注入上下文
+- 记忆相关信息可通过 memory tools 获取，而不是假设所有记忆都已注入上下文

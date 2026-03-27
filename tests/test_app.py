@@ -2,6 +2,7 @@ from novel_agent.app import (
     PROCESSING_PLACEHOLDER,
     _append_chat_history,
     _append_pending_chat_history,
+    _render_decision_output,
     _finalize_chat_history,
     _render_backend_status,
     _render_chat_html,
@@ -51,8 +52,8 @@ def test_render_chat_html_contains_both_messages():
 
 
 def test_render_hero_only_shows_app_title():
-    html = _render_hero("Novel Agent V3")
-    assert "Novel Agent V3" in html
+    html = _render_hero("Novel Agent V4")
+    assert "Novel Agent V4" in html
     assert "Closed-Domain Novel Agent" not in html
     assert "Markdown Memory" not in html
 
@@ -72,3 +73,24 @@ def test_render_loop_trace_wraps_body_with_loop_scroll_container():
     html = _render_loop_trace([])
     assert "panel-body-scroll loop-scroll" in html
     assert "empty-note" in html
+
+
+def test_render_loop_trace_shows_plan_events():
+    html = _render_loop_trace(
+        [
+            {"event_type": "plan_created", "payload": {"user_goal": "测试"}},
+            {"event_type": "plan_step_completed", "step_index": 1, "payload": {"goal": "先检索"}},
+            {"event_type": "plan_updated", "step_index": 2, "payload": {"user_goal": "重规划"}},
+        ]
+    )
+    assert "Plan Created" in html
+    assert "Step Completed" in html
+    assert "Plan Updated" in html
+
+
+def test_render_decision_output_wraps_body_with_decision_scroll_container():
+    html = _render_decision_output('{"steps":[{"step_index":1}]}', '{"action":"direct_reply"}', '{"verdict":"retry"}')
+    assert "panel-body-scroll decision-scroll" in html
+    assert "Planner Output" in html
+    assert "Decision Output" in html
+    assert "Review Output" in html

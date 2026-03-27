@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from .compaction import ContextCompactionManager, render_compact_summary_text
 from .config import AgentConfig
 from .context_engine import ContextEngine, ContextEngineDependencies
+from .embedding_index import EmbeddingIndexItem
 from .memory import SessionState, SessionStore
 from .registry import ToolRegistry
 from .schemas import (
@@ -18,13 +19,16 @@ from .schemas import (
     ContextReport,
     DecisionOutput,
     DecisionReviewOutput,
+    EmbeddingSimilarityArgs,
+    ExecutionPlanOutput,
     MemoryGetArgs,
     MemorySearchArgs,
     MemoryWrite,
+    PlanStep,
     RecentContentReference,
     TimeScope,
 )
-from .search_utils import extract_snippet, hybrid_search_score, mmr_rerank
+from .search_utils import extract_snippet, hybrid_search_score, hybrid_search_scores, mmr_rerank
 from .session_meta import SessionMetaStore
 from .workspace import WorkspaceManager
 
@@ -39,6 +43,8 @@ class ControllerDependencies:
     registry: ToolRegistry
     decision_backend: Any
     compression_backend: Any
+    embedding_backend: Any
+    embedding_index_manager: Any | None = None
     session_store: SessionStore | None = None
     meta_store: SessionMetaStore | None = None
     compaction_manager: ContextCompactionManager | None = None
@@ -53,6 +59,18 @@ class ToolExecutionResult:
     terminal: bool = False
     final_reply: str = ""
     thinking: str = ""
+
+
+@dataclass(slots=True)
+class TurnPlanState:
+    plan: ExecutionPlanOutput
+    current_position: int = 0
+    completed_steps: list[PlanStep] | None = None
+    replan_used: bool = False
+
+    def __post_init__(self) -> None:
+        if self.completed_steps is None:
+            self.completed_steps = []
 
 
 class NovelAgentController:
@@ -81,12 +99,78 @@ class NovelAgentController:
         used_tool = False
         review_passes = 0
         context_report = ContextReport()
+        planning_context = self.context_engine.build_turn_context(
+            session=session,
+            user_text=user_text,
+            loop_events=[],
+        )
+        context_report = self._merge_context_report(context_report, planning_context.context_report)
 
-        for step_index in range(1, self.deps.config.agent_max_loop_steps + 1):
+        try:
+            plan = self.deps.decision_backend.plan_turn(
+                user_text=user_text,
+                messages=planning_context.messages,
+                workspace_docs=planning_context.workspace_docs,
+                session_summary=planning_context.session_summary,
+                compacted_session_context=planning_context.compacted_session_context,
+                recent_content_references=planning_context.recent_content_references,
+                loop_events=planning_context.loop_events,
+            )
+        except ValidationError as exc:
+            return self._finalize_error(
+                session,
+                f"计划结果校验失败: {exc}",
+                transcript_events=transcript_events,
+                context_report=context_report,
+            )
+        except Exception as exc:
+            return self._finalize_error(
+                session,
+                f"计划后端不可用: {exc}",
+                transcript_events=transcript_events,
+                context_report=context_report,
+            )
+
+        if not isinstance(plan, ExecutionPlanOutput):
+            try:
+                plan = ExecutionPlanOutput.model_validate(plan)
+            except ValidationError as exc:
+                return self._finalize_error(
+                    session,
+                    f"计划结果校验失败: {exc}",
+                    transcript_events=transcript_events,
+                    context_report=context_report,
+                )
+
+        plan_state = TurnPlanState(plan=plan)
+        plan_created_event = self._plan_event(turn_index, "plan_created", plan)
+        transcript_events.append(plan_created_event)
+        loop_events.append(
+            {
+                "step_index": 0,
+                "event_type": "plan_created",
+                "payload": plan.model_dump(),
+            }
+        )
+
+        for loop_step_index in range(1, self.deps.config.agent_max_loop_steps + 1):
+            current_plan_step = self._current_plan_step(plan_state)
+            if current_plan_step is None:
+                return self._finalize_error(
+                    session,
+                    "当前请求暂时无法处理",
+                    transcript_events=transcript_events,
+                    tool_trace={"steps": tool_steps, "status": "plan_exhausted"},
+                    context_report=context_report,
+                )
+
             context_bundle = self.context_engine.build_turn_context(
                 session=session,
                 user_text=user_text,
                 loop_events=loop_events,
+                execution_plan=plan_state.plan.model_dump(),
+                current_step=current_plan_step.model_dump(),
+                completed_steps=[step.model_dump() for step in plan_state.completed_steps or []],
             )
             context_report = self._merge_context_report(context_report, context_bundle.context_report)
 
@@ -98,6 +182,9 @@ class NovelAgentController:
                     compacted_session_context=context_bundle.compacted_session_context,
                     recent_content_references=context_bundle.recent_content_references,
                     loop_events=context_bundle.loop_events,
+                    execution_plan=plan_state.plan.model_dump(),
+                    current_step=current_plan_step.model_dump(),
+                    completed_steps=[step.model_dump() for step in plan_state.completed_steps or []],
                 )
             except ValidationError as exc:
                 return self._finalize_error(
@@ -125,8 +212,31 @@ class NovelAgentController:
                         context_report=context_report,
                     )
 
-            transcript_events.append(self._decision_event(turn_index, step_index, decision))
+            transcript_events.append(self._decision_event(turn_index, loop_step_index, decision))
             self._merge_memory_write(aggregated_memory, decision.memory_write)
+
+            if decision.plan_update is not None:
+                if not plan_state.replan_used:
+                    plan_state.plan = decision.plan_update
+                    plan_state.current_position = 0
+                    plan_state.replan_used = True
+                    current_plan_step = self._current_plan_step(plan_state)
+                    transcript_events.append(self._plan_event(turn_index, "plan_updated", plan_state.plan))
+                    loop_events.append(
+                        {
+                            "step_index": loop_step_index,
+                            "event_type": "plan_updated",
+                            "payload": plan_state.plan.model_dump(),
+                        }
+                    )
+                else:
+                    loop_events.append(
+                        {
+                            "step_index": loop_step_index,
+                            "event_type": "plan_update_ignored",
+                            "payload": decision.plan_update.model_dump(),
+                        }
+                    )
 
             if decision.domain == "out_of_scope":
                 return self._finalize_success(
@@ -142,11 +252,13 @@ class NovelAgentController:
                 )
 
             if decision.action == "direct_reply":
-                if self._should_review_direct_reply(used_tool=used_tool, review_passes=review_passes):
+                if self._should_review_direct_reply(review_passes=review_passes):
                     review = self._review_direct_reply(
                         user_text=user_text,
                         decision=decision,
                         context_bundle=context_bundle,
+                        plan_state=plan_state,
+                        current_step=current_plan_step,
                     )
                     context_report.review_triggered = True
                     context_report.review_verdict = review.verdict
@@ -155,7 +267,7 @@ class NovelAgentController:
                         self._event(
                             turn_index,
                             "decision_review",
-                            step_index=step_index,
+                            step_index=loop_step_index,
                             payload=review.model_dump(),
                         )
                     )
@@ -163,13 +275,22 @@ class NovelAgentController:
                         review_passes += 1
                         loop_events.append(
                             {
-                                "step_index": step_index,
+                                "step_index": loop_step_index,
                                 "event_type": "decision_review",
                                 "verdict": review.verdict,
                                 "reason": review.reason,
                             }
                         )
                         continue
+                plan_state.completed_steps.append(current_plan_step)
+                transcript_events.append(self._plan_step_completed_event(turn_index, current_plan_step))
+                loop_events.append(
+                    {
+                        "step_index": current_plan_step.step_index,
+                        "event_type": "plan_step_completed",
+                        "goal": current_plan_step.goal,
+                    }
+                )
                 reply = decision.assistant_reply.strip() or "当前请求暂时无法处理"
                 final_action = "call_tool" if used_tool else "direct_reply"
                 return self._finalize_success(
@@ -210,7 +331,7 @@ class NovelAgentController:
             result = self._handle_tool_step(
                 session=session,
                 turn_index=turn_index,
-                step_index=step_index,
+                step_index=loop_step_index,
                 decision=decision,
                 transcript_events=transcript_events,
                 tool_steps=tool_steps,
@@ -218,13 +339,22 @@ class NovelAgentController:
                 context_report=context_report,
             )
             if result is not None:
+                completed_event = self._plan_step_completed_event(turn_index, current_plan_step)
+                if result.transcript_events is transcript_events:
+                    result.transcript_events.append(completed_event)
+                else:
+                    transcript_events.append(completed_event)
+                    result.transcript_events.append(completed_event)
                 return result
 
             used_tool = True
+            plan_state.completed_steps.append(current_plan_step)
+            plan_state.current_position += 1
+            transcript_events.append(self._plan_step_completed_event(turn_index, current_plan_step))
             latest_step = tool_steps[-1]
             loop_events.append(
                 {
-                    "step_index": step_index,
+                    "step_index": loop_step_index,
                     "event_type": "tool_call",
                     "tool_name": latest_step["requested_tool"],
                     "tool_args": latest_step.get("tool_args", {}),
@@ -232,10 +362,17 @@ class NovelAgentController:
             )
             loop_events.append(
                 {
-                    "step_index": step_index,
+                    "step_index": loop_step_index,
                     "event_type": "tool_result",
                     "tool_name": latest_step["requested_tool"],
                     "observation": latest_step.get("observation", ""),
+                }
+            )
+            loop_events.append(
+                {
+                    "step_index": current_plan_step.step_index,
+                    "event_type": "plan_step_completed",
+                    "goal": current_plan_step.goal,
                 }
             )
 
@@ -344,15 +481,14 @@ class NovelAgentController:
 
     def _execute_tool(self, session: SessionState, tool_name: str, tool_args: dict[str, Any]) -> ToolExecutionResult:
         if tool_name == "compress_chapter":
-            seed_value = tool_args.get("seed", self.deps.config.compression_seed)
             request = CompressionRequest(
                 raw_text=str(tool_args["raw_text"]),
-                max_new_tokens=int(tool_args.get("max_new_tokens", self.deps.config.compression_max_new_tokens)),
-                temperature=float(tool_args.get("temperature", self.deps.config.compression_temperature)),
-                seed=int(seed_value) if seed_value not in (None, "") else None,
-                top_p=float(tool_args.get("top_p", self.deps.config.compression_top_p)),
-                top_k=int(tool_args.get("top_k", self.deps.config.compression_top_k)),
-                enable_thinking=bool(tool_args.get("enable_thinking", True)),
+                max_new_tokens=self.deps.config.compression_max_new_tokens,
+                temperature=self.deps.config.compression_temperature,
+                seed=self.deps.config.compression_seed,
+                top_p=self.deps.config.compression_top_p,
+                top_k=self.deps.config.compression_top_k,
+                enable_thinking=self.deps.config.compression_enable_thinking,
             )
             tool_result = self.deps.compression_backend.compress(request)
             return ToolExecutionResult(
@@ -419,14 +555,48 @@ class NovelAgentController:
                     "delivery_mode": memory_args.delivery_mode,
                 },
                 terminal=memory_args.delivery_mode == "deliver",
-                final_reply=content or "未找到对应内容。",
+                final_reply=(content or "未找到对应内容。") if memory_args.delivery_mode == "deliver" else "",
+            )
+
+        if tool_name == "embedding_similarity":
+            similarity_args = EmbeddingSimilarityArgs.model_validate(tool_args)
+            candidates = [similarity_args.text] if similarity_args.text else list(similarity_args.texts)
+            scores = self.deps.embedding_backend.similarity_batch(similarity_args.query, candidates)
+            ranked = [
+                {
+                    "index": index + 1,
+                    "score": float(score),
+                    "text": text,
+                    "preview": extract_snippet(text, similarity_args.query, max_chars=220),
+                }
+                for index, (text, score) in enumerate(zip(candidates, scores))
+            ]
+            ranked.sort(key=lambda item: item["score"], reverse=True)
+            if similarity_args.top_k is not None:
+                ranked = ranked[: similarity_args.top_k]
+            observation_lines = [
+                f"{index}. score={item['score']:.4f} length={len(item['text'])}\npreview: {item['preview']}"
+                for index, item in enumerate(ranked, start=1)
+            ]
+            observation = "\n".join(observation_lines) if observation_lines else "embedding_similarity 无可比较文本。"
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                observation_text=self._truncate_memory_text(observation),
+                payload={
+                    "query": similarity_args.query,
+                    "items": ranked,
+                },
+                tool_trace={
+                    "requested_tool": tool_name,
+                    "status": "ok",
+                    "candidate_count": len(candidates),
+                },
+                terminal=False,
             )
 
         raise ValueError("unsupported_tool")
 
-    def _should_review_direct_reply(self, *, used_tool: bool, review_passes: int) -> bool:
-        if used_tool:
-            return False
+    def _should_review_direct_reply(self, *, review_passes: int) -> bool:
         if not self.deps.config.decision_reflection_enabled:
             return False
         return review_passes < max(self.deps.config.decision_reflection_max_passes, 0)
@@ -437,6 +607,8 @@ class NovelAgentController:
         user_text: str,
         decision: DecisionOutput,
         context_bundle: Any,
+        plan_state: TurnPlanState,
+        current_step: PlanStep,
     ) -> DecisionReviewOutput:
         reviewer = getattr(self.deps.decision_backend, "review_decision", None)
         if not callable(reviewer):
@@ -449,6 +621,9 @@ class NovelAgentController:
                 compacted_session_context=context_bundle.compacted_session_context,
                 recent_content_references=context_bundle.recent_content_references,
                 loop_events=context_bundle.loop_events,
+                execution_plan=plan_state.plan.model_dump(),
+                current_step=current_step.model_dump(),
+                completed_steps=[step.model_dump() for step in plan_state.completed_steps or []],
                 decision=decision.model_dump(),
                 user_text=user_text,
             )
@@ -460,6 +635,13 @@ class NovelAgentController:
             return DecisionReviewOutput.model_validate(review)
         except ValidationError:
             return DecisionReviewOutput(verdict="accept", reason="review_validation_failed")
+
+    def _current_plan_step(self, plan_state: TurnPlanState) -> PlanStep | None:
+        if plan_state.current_position < 0:
+            return None
+        if plan_state.current_position >= len(plan_state.plan.steps):
+            return None
+        return plan_state.plan.steps[plan_state.current_position]
 
     def _compaction_manager(self) -> ContextCompactionManager | None:
         return self.deps.compaction_manager
@@ -502,6 +684,7 @@ class NovelAgentController:
         time_scope: TimeScope | None,
         exclude_latest_user_message: bool,
     ) -> list[dict[str, Any]]:
+        query_embedding = self._build_query_embedding(query)
         if scope == "current_session":
             return self._merge_ranked_lookup_tiers(
                 [
@@ -515,6 +698,7 @@ class NovelAgentController:
                         session=session,
                         query=query,
                         max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
+                        query_embedding=query_embedding,
                     ),
                     self.deps.workspace.memory_search(
                         query=query,
@@ -531,6 +715,7 @@ class NovelAgentController:
                     max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
                     scope=scope,
                     time_scope=time_scope,
+                    query_embedding=query_embedding,
                 ),
                 self._search_archived_session_context(
                     session=session,
@@ -538,6 +723,7 @@ class NovelAgentController:
                     max_results=max_results * SESSION_SEARCH_CANDIDATE_MULTIPLIER,
                     scope=scope,
                     time_scope=time_scope,
+                    query_embedding=query_embedding,
                 ),
                 self.deps.workspace.memory_search(
                     query=query,
@@ -577,7 +763,14 @@ class NovelAgentController:
                     "source_kind": "time_window_summary",
                     "source_path": window_summary["time_range"],
                     "target": window_summary["target"],
-                    "score": max(hybrid_search_score(query, window_summary["content"]), 0.5),
+                    "score": max(
+                        hybrid_search_score(
+                            query,
+                            window_summary["content"],
+                            embedding_backend=self.deps.embedding_backend,
+                        ),
+                        0.5,
+                    ),
                     "summary_preview": window_summary["summary_preview"],
                     "topics": window_summary["topics"],
                     "time_range": window_summary["time_range"],
@@ -602,7 +795,11 @@ class NovelAgentController:
             "source_kind": "session_compact",
             "source_path": artifact.session_id,
             "target": f"session_compact:{artifact.session_id}",
-            "score": hybrid_search_score(query, preview + "\n" + render_compact_summary_text(artifact)),
+            "score": hybrid_search_score(
+                query,
+                preview + "\n" + render_compact_summary_text(artifact),
+                embedding_backend=self.deps.embedding_backend,
+            ),
             "summary_preview": preview,
             "topics": ", ".join(artifact.discussion_topics),
             "time_range": artifact.updated_at[:10] if artifact.updated_at else "",
@@ -620,10 +817,18 @@ class NovelAgentController:
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         last_user_index = len(session.messages)
+        eligible: list[tuple[int, Any]] = []
         for index, item in enumerate(session.messages, start=1):
             if exclude_latest_user_message and index == last_user_index and item.role == "user":
                 continue
-            score, snippet = self._score_text_match(query, item.content)
+            eligible.append((index, item))
+        scores = hybrid_search_scores(
+            query,
+            [item.content for _, item in eligible],
+            embedding_backend=self.deps.embedding_backend,
+        )
+        for (index, item), score in zip(eligible, scores):
+            snippet = extract_snippet(item.content, query, max_chars=220)
             if score <= 0:
                 continue
             role = item.role or "unknown"
@@ -647,12 +852,18 @@ class NovelAgentController:
         session: SessionState,
         query: str,
         max_results: int,
+        query_embedding: Any | None = None,
     ) -> list[dict[str, Any]]:
         manager = self._compaction_manager()
         if manager is None:
             return []
         artifact = manager.load_or_build_artifact(session)
-        return self._search_compact_artifact_chunks(query=query, artifacts=[artifact], max_results=max_results)
+        return self._search_compact_artifact_chunks(
+            query=query,
+            artifacts=[artifact],
+            max_results=max_results,
+            query_embedding=query_embedding,
+        )
 
     def _search_archived_session_context(
         self,
@@ -662,6 +873,7 @@ class NovelAgentController:
         max_results: int,
         scope: str,
         time_scope: TimeScope | None,
+        query_embedding: Any | None = None,
     ) -> list[dict[str, Any]]:
         store = self.deps.session_store
         if store is None or max_results <= 0:
@@ -674,18 +886,37 @@ class NovelAgentController:
             if archived_session is None:
                 continue
             recent_messages = archived_session.messages[-per_session_limit:]
+            if not recent_messages:
+                continue
             base_index = max(len(archived_session.messages) - len(recent_messages), 0)
-            for offset, item in enumerate(recent_messages, start=1):
-                score, snippet = self._score_text_match(query, item.content)
+            items = [
+                EmbeddingIndexItem.create(
+                    source_id=f"session:{session_id}:{item.role}:{base_index + offset}",
+                    source_kind="session_archive",
+                    source_path=session_id,
+                    target=f"session:{session_id}:{item.role}:{base_index + offset}",
+                    text=item.content,
+                )
+                for offset, item in enumerate(recent_messages, start=1)
+            ]
+            scores = self._score_indexed_items(
+                query=query,
+                items=items,
+                shard_path=self.deps.embedding_index_manager.session_shard_path(session_id)
+                if self.deps.embedding_index_manager is not None
+                else None,
+                query_embedding=query_embedding,
+            )
+            for metadata, original, score in zip(items, recent_messages, scores):
+                snippet = extract_snippet(original.content, query, max_chars=220)
                 if score <= 0:
                     continue
-                absolute_index = base_index + offset
                 results.append(
                     {
-                        "source_id": f"session:{session_id}:{item.role}:{absolute_index}",
-                        "source_kind": "session_archive",
-                        "source_path": session_id,
-                        "target": f"session:{session_id}:{item.role}:{absolute_index}",
+                        "source_id": metadata.source_id,
+                        "source_kind": metadata.source_kind,
+                        "source_path": metadata.source_path,
+                        "target": metadata.target,
                         "score": score,
                         "snippet": snippet,
                     }
@@ -701,9 +932,15 @@ class NovelAgentController:
         max_results: int,
         scope: str,
         time_scope: TimeScope | None,
+        query_embedding: Any | None = None,
     ) -> list[dict[str, Any]]:
         artifacts = self._history_compaction_artifacts(session, scope=scope, time_scope=time_scope)
-        return self._search_compact_artifact_chunks(query=query, artifacts=artifacts, max_results=max_results)
+        return self._search_compact_artifact_chunks(
+            query=query,
+            artifacts=artifacts,
+            max_results=max_results,
+            query_embedding=query_embedding,
+        )
 
     def _search_compact_artifact_chunks(
         self,
@@ -711,22 +948,41 @@ class NovelAgentController:
         query: str,
         artifacts: list[Any],
         max_results: int,
+        query_embedding: Any | None = None,
     ) -> list[dict[str, Any]]:
         manager = self._compaction_manager()
         if manager is None:
             return []
         results: list[dict[str, Any]] = []
         for artifact in artifacts:
-            for chunk in manager.search_chunks(artifact):
-                score = hybrid_search_score(query, chunk["text"])
+            chunks = manager.search_chunks(artifact)
+            items = [
+                EmbeddingIndexItem.create(
+                    source_id=chunk["target"],
+                    source_kind=chunk["source_kind"],
+                    source_path=chunk["source_path"],
+                    target=chunk["target"],
+                    text=chunk["text"],
+                )
+                for chunk in chunks
+            ]
+            scores = self._score_indexed_items(
+                query=query,
+                items=items,
+                shard_path=self.deps.embedding_index_manager.compaction_shard_path(artifact.session_id)
+                if self.deps.embedding_index_manager is not None
+                else None,
+                query_embedding=query_embedding,
+            )
+            for chunk, item, score in zip(chunks, items, scores):
                 if score <= 0:
                     continue
                 results.append(
                     {
-                        "source_id": chunk["target"],
-                        "source_kind": chunk["source_kind"],
-                        "source_path": chunk["source_path"],
-                        "target": chunk["target"],
+                        "source_id": item.source_id,
+                        "source_kind": item.source_kind,
+                        "source_path": item.source_path,
+                        "target": item.target,
                         "score": score,
                         "snippet": extract_snippet(chunk["text"], query, max_chars=220),
                         "summary_preview": chunk["summary_preview"],
@@ -739,6 +995,38 @@ class NovelAgentController:
             self._prefer_specific_compact_targets(results),
             max_results=max_results,
         )
+
+    def _build_query_embedding(self, query: str) -> Any | None:
+        manager = self.deps.embedding_index_manager
+        if manager is None or not self.deps.config.embedding_index_enabled:
+            return None
+        clean_query = query.strip()
+        if not clean_query:
+            return None
+        return manager.build_query_embedding(clean_query)
+
+    def _score_indexed_items(
+        self,
+        *,
+        query: str,
+        items: list[EmbeddingIndexItem],
+        shard_path: Any | None,
+        query_embedding: Any | None = None,
+    ) -> list[float]:
+        manager = self.deps.embedding_index_manager
+        if manager is None or shard_path is None or not self.deps.config.embedding_index_enabled:
+            return hybrid_search_scores(
+                query,
+                [item.text for item in items],
+                embedding_backend=self.deps.embedding_backend,
+            )
+        if query_embedding is not None:
+            return manager.score_items_with_query_embedding(
+                query_embedding,
+                items,
+                shard_path=shard_path,
+            )
+        return manager.score_items(query, items, shard_path=shard_path)
 
     def _prefer_specific_compact_targets(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not results:
@@ -862,16 +1150,6 @@ class NovelAgentController:
                 payload["score"] = float(payload.get("score", 0.0)) + tier_bias
                 merged.append(payload)
         return self._rerank_search_results(merged, max_results=max_results)
-
-    def _score_text_match(self, query: str, content: str) -> tuple[float, str]:
-        clean_query = query.strip()
-        text = content.strip()
-        if not clean_query or not text:
-            return 0.0, ""
-        score = hybrid_search_score(clean_query, text)
-        if score <= 0:
-            return 0.0, ""
-        return score, extract_snippet(text, clean_query, max_chars=220)
 
     def _format_memory_search_results(self, results: list[dict[str, Any]], *, search_mode: str) -> str:
         lines: list[str] = []
@@ -1173,25 +1451,27 @@ class NovelAgentController:
         )
         return extract_snippet(clean, clean, max_chars=preview_limit)
 
-    def _build_default_compress_tool_args(self, raw_text: str) -> dict[str, Any]:
-        tool_args = {
-            "raw_text": raw_text,
-            "max_new_tokens": self.deps.config.compression_max_new_tokens,
-            "temperature": self.deps.config.compression_temperature,
-            "top_p": self.deps.config.compression_top_p,
-            "top_k": self.deps.config.compression_top_k,
-            "enable_thinking": True,
-        }
-        if self.deps.config.compression_seed is not None:
-            tool_args["seed"] = self.deps.config.compression_seed
-        return tool_args
-
     def _decision_event(self, turn_index: int, step_index: int, decision: DecisionOutput) -> dict[str, Any]:
         return self._event(
             turn_index,
             "agent_decision",
             step_index=step_index,
             payload=decision.model_dump(),
+        )
+
+    def _plan_event(self, turn_index: int, event_type: str, plan: ExecutionPlanOutput) -> dict[str, Any]:
+        return self._event(
+            turn_index,
+            event_type,
+            payload=plan.model_dump(),
+        )
+
+    def _plan_step_completed_event(self, turn_index: int, step: PlanStep) -> dict[str, Any]:
+        return self._event(
+            turn_index,
+            "plan_step_completed",
+            step_index=step.step_index,
+            payload=step.model_dump(),
         )
 
     def _event(self, turn_index: int, event_type: str, **payload: Any) -> dict[str, Any]:

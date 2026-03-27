@@ -23,10 +23,15 @@ class SessionMeta:
     dirty_daily_memory: bool = False
     dirty_long_term: bool = False
     dirty_compaction: bool = False
+    dirty_embedding: bool = False
     cached_summary: str = ""
     cached_compact_summary: str = ""
     latest_transcript_path: str = ""
     latest_compaction_path: str = ""
+    latest_session_embedding_path: str = ""
+    latest_compaction_embedding_path: str = ""
+    last_embedding_turn_index: int = 0
+    last_embedding_at: str = ""
     recent_content_references: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -78,6 +83,6 @@ class SessionMetaStore:
     def list_dirty_sessions(self) -> list[SessionMeta]:
         results = []
         for meta in self.list_all():
-            if meta.dirty_summary or meta.dirty_daily_memory or meta.dirty_long_term or meta.dirty_compaction:
+            if meta.dirty_summary or meta.dirty_daily_memory or meta.dirty_long_term or meta.dirty_compaction or meta.dirty_embedding:
                 results.append(meta)
         return results

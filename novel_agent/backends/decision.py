@@ -6,8 +6,12 @@ from pathlib import Path
 from typing import Any
 
 from ..config import AgentConfig
-from ..prompts import build_decision_review_system_prompt, build_decision_system_prompt
-from ..schemas import BackendHealth, DecisionOutput, DecisionReviewOutput
+from ..prompts import (
+    build_decision_review_system_prompt,
+    build_decision_system_prompt,
+    build_plan_system_prompt,
+)
+from ..schemas import BackendHealth, DecisionOutput, DecisionReviewOutput, ExecutionPlanOutput
 from ..utils import extract_json_object, split_think_and_answer
 from .base import BaseBackend
 
@@ -116,6 +120,11 @@ class LocalDecisionBackend(BaseBackend):
         self._tokenizer = None
         self._model = None
         self._load_error: str | None = None
+        self.last_decision_thinking: str = ""
+        self.last_review_thinking: str = ""
+        self.last_plan_output_text: str = ""
+        self.last_decision_output_text: str = ""
+        self.last_review_output_text: str = ""
 
     def healthcheck(self) -> BackendHealth:
         if not self.model_path.exists():
@@ -140,6 +149,32 @@ class LocalDecisionBackend(BaseBackend):
         if load_model:
             self._model = _load_model_with_runtime(AutoModelForCausalLM, self.model_path, torch)
 
+    def plan_turn(
+        self,
+        *,
+        user_text: str,
+        messages: list[dict[str, str]],
+        workspace_docs: str,
+        session_summary: str,
+        compacted_session_context: str = "",
+        recent_content_references: str = "",
+        loop_events: list[dict[str, Any]] | None = None,
+    ) -> ExecutionPlanOutput:
+        payload, _, output_text = self._generate_json_payload(
+            system_prompt=build_plan_system_prompt(workspace_docs),
+            user_content=(
+                "请先为当前用户问题生成一个显式执行计划 JSON。\n\n"
+                f"User Message:\n{user_text}\n\n"
+                f"Session Summary:\n{session_summary or '(empty)'}\n\n"
+                f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
+                f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
+                f"Messages:\n{json.dumps(messages, ensure_ascii=False)}\n\n"
+                f"Loop Events:\n{json.dumps(loop_events or [], ensure_ascii=False)}"
+            ),
+        )
+        self.last_plan_output_text = output_text
+        return ExecutionPlanOutput.model_validate(payload)
+
     def decide(
         self,
         messages: list[dict[str, str]],
@@ -148,11 +183,17 @@ class LocalDecisionBackend(BaseBackend):
         compacted_session_context: str = "",
         recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
+        execution_plan: dict[str, Any] | None = None,
+        current_step: dict[str, Any] | None = None,
+        completed_steps: list[dict[str, Any]] | None = None,
     ) -> DecisionOutput:
-        payload = self._generate_json_payload(
+        payload, thinking, output_text = self._generate_json_payload(
             system_prompt=build_decision_system_prompt(workspace_docs),
             user_content=(
                 "请根据以下对话和会话摘要输出决策 JSON。\n\n"
+                f"Execution Plan:\n{json.dumps(execution_plan or {}, ensure_ascii=False)}\n\n"
+                f"Current Step:\n{json.dumps(current_step or {}, ensure_ascii=False)}\n\n"
+                f"Completed Steps:\n{json.dumps(completed_steps or [], ensure_ascii=False)}\n\n"
                 f"Session Summary:\n{session_summary or '(empty)'}\n\n"
                 f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
                 f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
@@ -160,6 +201,8 @@ class LocalDecisionBackend(BaseBackend):
                 f"Loop Events:\n{json.dumps(loop_events or [], ensure_ascii=False)}"
             ),
         )
+        self.last_decision_thinking = thinking
+        self.last_decision_output_text = output_text
         return DecisionOutput.model_validate(payload)
 
     def review_decision(
@@ -171,14 +214,20 @@ class LocalDecisionBackend(BaseBackend):
         compacted_session_context: str = "",
         recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
+        execution_plan: dict[str, Any] | None = None,
+        current_step: dict[str, Any] | None = None,
+        completed_steps: list[dict[str, Any]] | None = None,
         decision: dict[str, Any],
         user_text: str,
     ) -> DecisionReviewOutput:
-        payload = self._generate_json_payload(
+        payload, thinking, output_text = self._generate_json_payload(
             system_prompt=build_decision_review_system_prompt(workspace_docs),
             user_content=(
                 "请判断下面这条 direct_reply 是否已经有足够证据支撑。\n\n"
                 f"User Message:\n{user_text}\n\n"
+                f"Execution Plan:\n{json.dumps(execution_plan or {}, ensure_ascii=False)}\n\n"
+                f"Current Step:\n{json.dumps(current_step or {}, ensure_ascii=False)}\n\n"
+                f"Completed Steps:\n{json.dumps(completed_steps or [], ensure_ascii=False)}\n\n"
                 f"Session Summary:\n{session_summary or '(empty)'}\n\n"
                 f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
                 f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
@@ -187,6 +236,8 @@ class LocalDecisionBackend(BaseBackend):
                 f"Candidate Decision:\n{json.dumps(decision, ensure_ascii=False)}"
             ),
         )
+        self.last_review_thinking = thinking
+        self.last_review_output_text = output_text
         return DecisionReviewOutput.model_validate(payload)
 
     def estimate_prompt_tokens(
@@ -198,6 +249,9 @@ class LocalDecisionBackend(BaseBackend):
         compacted_session_context: str = "",
         recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
+        execution_plan: dict[str, Any] | None = None,
+        current_step: dict[str, Any] | None = None,
+        completed_steps: list[dict[str, Any]] | None = None,
     ) -> int:
         self._ensure_loaded(load_model=False)
         assert self._tokenizer is not None
@@ -209,6 +263,9 @@ class LocalDecisionBackend(BaseBackend):
                 "role": "user",
                 "content": (
                     "请根据以下对话和会话摘要输出决策 JSON。\n\n"
+                    f"Execution Plan:\n{json.dumps(execution_plan or {}, ensure_ascii=False)}\n\n"
+                    f"Current Step:\n{json.dumps(current_step or {}, ensure_ascii=False)}\n\n"
+                    f"Completed Steps:\n{json.dumps(completed_steps or [], ensure_ascii=False)}\n\n"
                     f"Session Summary:\n{session_summary or '(empty)'}\n\n"
                     f"Compacted Session Context:\n{compacted_session_context or '(empty)'}\n\n"
                     f"Recent Content References:\n{recent_content_references or '(empty)'}\n\n"
@@ -233,7 +290,7 @@ class LocalDecisionBackend(BaseBackend):
         tokenized = self._tokenizer([prompt], return_tensors="pt")
         return int(tokenized.input_ids.shape[-1])
 
-    def _generate_json_payload(self, *, system_prompt: str, user_content: str) -> dict[str, Any]:
+    def _generate_json_payload(self, *, system_prompt: str, user_content: str) -> tuple[dict[str, Any], str, str]:
         self._ensure_loaded(load_model=True)
         assert self._tokenizer is not None
         assert self._model is not None
@@ -266,5 +323,6 @@ class LocalDecisionBackend(BaseBackend):
             do_sample=bool(self.config.decision_temperature > 0),
         )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
-        _, answer = split_think_and_answer(self._tokenizer, output_ids)
-        return extract_json_object(answer)
+        thinking, answer = split_think_and_answer(self._tokenizer, output_ids)
+        raw_output = self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        return extract_json_object(answer), thinking, raw_output

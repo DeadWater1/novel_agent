@@ -13,11 +13,6 @@ from .schemas import ContextBuildResult, ContextReport, RecentContentReference
 from .session_meta import SessionMetaStore
 from .workspace import WorkspaceManager
 
-
-AUTO_RECALL_MAX_RESULTS = 3
-AUTO_RECALL_MIN_SCORE = 0.32
-
-
 @dataclass(slots=True)
 class ContextEngineDependencies:
     config: AgentConfig
@@ -39,6 +34,9 @@ class ContextEngine:
         session: SessionState,
         user_text: str,
         loop_events: list[dict[str, Any]],
+        execution_plan: dict[str, Any] | None = None,
+        current_step: dict[str, Any] | None = None,
+        completed_steps: list[dict[str, Any]] | None = None,
     ) -> ContextBuildResult:
         report = ContextReport(context_blocks=["messages", "session_summary"])
         active_messages = self._recent_messages(session)
@@ -61,11 +59,7 @@ class ContextEngine:
         if recent_content_references.strip():
             report.context_blocks.append("recent_content_references")
 
-        recalled_memory, recall_targets = self._build_auto_recall_context(session=session, user_text=user_text)
-        if recalled_memory.strip():
-            report.context_blocks.append("recalled_memory")
-            report.recall_targets = recall_targets
-
+        recalled_memory = ""
         workspace_docs = self.deps.workspace.load_workspace_docs(session.summary, recalled_memory)
         report.context_blocks.append("workspace_docs")
 
@@ -76,6 +70,9 @@ class ContextEngine:
             compacted_session_context=compacted_session_context,
             recent_content_references=recent_content_references,
             loop_events=active_loop_events,
+            execution_plan=execution_plan,
+            current_step=current_step,
+            completed_steps=completed_steps,
         )
         report.estimated_tokens = estimated_tokens
 
@@ -88,6 +85,9 @@ class ContextEngine:
             compacted_session_context=compacted_session_context,
             recent_content_references=recent_content_references,
             loop_events=active_loop_events,
+            execution_plan=execution_plan,
+            current_step=current_step,
+            completed_steps=completed_steps,
             report=report,
         )
         report.estimated_tokens = estimated_tokens
@@ -112,6 +112,9 @@ class ContextEngine:
                     compacted_session_context=compacted_session_context,
                     recent_content_references=recent_content_references,
                     loop_events=active_loop_events,
+                    execution_plan=execution_plan,
+                    current_step=current_step,
+                    completed_steps=completed_steps,
                     report=report,
                 )
                 report.estimated_tokens = estimated_tokens
@@ -156,32 +159,6 @@ class ContextEngine:
             report.context_blocks.append("pruned_loop_events")
         return pruned
 
-    def _build_auto_recall_context(self, *, session: SessionState, user_text: str) -> tuple[str, list[str]]:
-        search_fn = self.deps.search_memory_fn
-        if search_fn is None:
-            return "", []
-        results = search_fn(
-            session=session,
-            query=user_text,
-            max_results=AUTO_RECALL_MAX_RESULTS,
-            search_mode="lookup",
-            scope="current_session",
-            exclude_latest_user_message=True,
-        )
-        filtered = [item for item in results if float(item.get("score", 0.0)) >= AUTO_RECALL_MIN_SCORE]
-        if not filtered:
-            return "", []
-        lines = ["以下内容由系统自动召回，仅在与当前问题确实相关时使用。"]
-        targets: list[str] = []
-        for index, item in enumerate(filtered, start=1):
-            source_kind = str(item.get("source_kind") or "memory")
-            target = str(item.get("target") or item["source_id"])
-            source_path = str(item.get("source_path") or "")
-            targets.append(target)
-            lines.append(f"{index}. [{source_kind}] target={target} source={source_path}")
-            lines.append(f"snippet: {item['snippet']}")
-        return "\n".join(lines), targets
-
     def _estimate_tokens(
         self,
         *,
@@ -191,6 +168,9 @@ class ContextEngine:
         compacted_session_context: str,
         recent_content_references: str,
         loop_events: list[dict[str, Any]],
+        execution_plan: dict[str, Any] | None = None,
+        current_step: dict[str, Any] | None = None,
+        completed_steps: list[dict[str, Any]] | None = None,
     ) -> int:
         estimator = getattr(self.deps.decision_backend, "estimate_prompt_tokens", None)
         if callable(estimator):
@@ -203,6 +183,9 @@ class ContextEngine:
                         compacted_session_context=compacted_session_context,
                         recent_content_references=recent_content_references,
                         loop_events=loop_events,
+                        execution_plan=execution_plan,
+                        current_step=current_step,
+                        completed_steps=completed_steps,
                     )
                 )
             except Exception:
@@ -213,6 +196,9 @@ class ContextEngine:
             + session_summary
             + compacted_session_context
             + recent_content_references
+            + str(execution_plan or {})
+            + str(current_step or {})
+            + str(completed_steps or [])
             + str(loop_events)
         )
         return max(len(merged) // 2, 1)
@@ -300,6 +286,9 @@ class ContextEngine:
         compacted_session_context: str,
         recent_content_references: str,
         loop_events: list[dict[str, Any]],
+        execution_plan: dict[str, Any] | None = None,
+        current_step: dict[str, Any] | None = None,
+        completed_steps: list[dict[str, Any]] | None = None,
         report: ContextReport,
     ) -> tuple[list[dict[str, Any]], int]:
         pruned = list(loop_events)
@@ -310,6 +299,9 @@ class ContextEngine:
             compacted_session_context=compacted_session_context,
             recent_content_references=recent_content_references,
             loop_events=pruned,
+            execution_plan=execution_plan,
+            current_step=current_step,
+            completed_steps=completed_steps,
         )
         if not self.deps.config.context_pruning_enabled:
             return pruned, estimated_tokens
@@ -330,6 +322,9 @@ class ContextEngine:
                 compacted_session_context=compacted_session_context,
                 recent_content_references=recent_content_references,
                 loop_events=pruned,
+                execution_plan=execution_plan,
+                current_step=current_step,
+                completed_steps=completed_steps,
             )
             if estimated_tokens <= self.deps.config.context_pruning_target_tokens:
                 break

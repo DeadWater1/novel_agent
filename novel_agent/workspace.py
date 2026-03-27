@@ -6,7 +6,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from .config import AgentConfig
-from .search_utils import extract_snippet, format_line_target, hybrid_search_score, mmr_rerank, recency_multiplier
+from .embedding_index import EmbeddingIndexItem
+from .search_utils import extract_snippet, format_line_target, hybrid_search_scores, mmr_rerank, recency_multiplier
 
 
 WORKSPACE_FILE_ORDER = (
@@ -47,10 +48,24 @@ class MemoryChunk:
 
 
 class WorkspaceManager:
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(
+        self,
+        config: AgentConfig,
+        *,
+        embedding_backend: object | None = None,
+        embedding_index_manager: object | None = None,
+    ) -> None:
         self.config = config
         self.root = Path(config.workspace_root)
         self.daily_root = self.root / "memory"
+        self.embedding_backend = embedding_backend
+        self.embedding_index_manager = embedding_index_manager
+
+    def set_embedding_backend(self, backend: object) -> None:
+        self.embedding_backend = backend
+
+    def set_embedding_index_manager(self, manager: object) -> None:
+        self.embedding_index_manager = manager
 
     def bootstrap(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -153,12 +168,12 @@ class WorkspaceManager:
         return (
             "# Memory Access\n\n"
             "长期记忆和日记式记忆默认不会被完整注入上下文。\n"
-            "系统会自动召回一小部分高相关记忆，但需要更完整的内容时仍应使用 memory_search 或 memory_get。\n"
+            "需要更完整的历史内容时可使用 memory_search 或 memory_get。\n"
             "memory_search 支持 lookup 与 recap 两种模式，会返回 snippet 或 summary_preview、target、source_path 等信息；如果结果不够，请把返回的 target 直接交给 memory_get。\n"
             "memory_get 支持 long_term、daily_latest、today、yesterday、daily:YYYY-MM-DD，"
             "也支持在其后附加 #L起始行-结束行，例如 daily:2026-03-26#L3-L12；"
             "session 检索结果也可以直接读取，例如 session:latest_compress、session:SESSION_ID:assistant:4、session_compact:SESSION_ID、session_compact:SESSION_ID#compression_history:0、session_compact:time_window:1-1#summary、content_ref:latest。"
-            "memory_get 默认直接交付全文；如果只需要内部观察，可以显式传 delivery_mode=observe。\n"
+            "memory_get 默认以 observe 模式读取内容；如果你明确要把全文直接交付给用户，可以显式传 delivery_mode=deliver。\n"
             f"当前常用 memory_get target: {targets_text}"
         )
 
@@ -166,11 +181,35 @@ class WorkspaceManager:
         clean_query = query.strip()
         if not clean_query:
             return []
+        if self.embedding_backend is None:
+            raise RuntimeError("embedding_backend_not_configured")
 
         limit = max_results or self.config.memory_search_max_results
         candidates: list[dict[str, str | float | int]] = []
-        for chunk in self._iter_memory_chunks():
-            score = hybrid_search_score(clean_query, chunk.text)
+        chunks = self._iter_memory_chunks()
+        items = [
+            EmbeddingIndexItem.create(
+                source_id=chunk.source_id,
+                source_kind=chunk.source_kind,
+                source_path=chunk.source_path,
+                target=chunk.target,
+                text=chunk.text,
+            )
+            for chunk in chunks
+        ]
+        if self.embedding_index_manager is not None and self.config.embedding_index_enabled:
+            scores = self.embedding_index_manager.score_items(
+                clean_query,
+                items,
+                shard_path=self.embedding_index_manager.workspace_shard_path(),
+            )
+        else:
+            scores = hybrid_search_scores(
+                clean_query,
+                [chunk.text for chunk in chunks],
+                embedding_backend=self.embedding_backend,
+            )
+        for chunk, score in zip(chunks, scores):
             if score <= 0:
                 continue
             score *= recency_multiplier(chunk.source_id)

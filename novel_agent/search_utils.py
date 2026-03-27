@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import hashlib
-import math
 import re
-from collections import Counter
 from datetime import date
-from typing import Any
+from typing import Any, Sequence
 
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+")
@@ -35,77 +32,36 @@ def tokenize_for_search(text: str) -> list[str]:
     return tokens
 
 
-def hybrid_search_score(query: str, text: str) -> float:
-    query_tokens = tokenize_for_search(query)
-    text_tokens = tokenize_for_search(text)
-    if not query_tokens or not text_tokens:
-        return 0.0
-
-    keyword = keyword_overlap_score(query, text, query_tokens=query_tokens, text_tokens=text_tokens)
-    vector = max(0.0, vector_cosine(hash_vector(query_tokens), hash_vector(text_tokens)))
-    return keyword * 0.72 + vector * 0.28
+def hybrid_search_score(query: str, text: str, *, embedding_backend: Any) -> float:
+    scores = hybrid_search_scores(query, [text], embedding_backend=embedding_backend)
+    return scores[0] if scores else 0.0
 
 
-def keyword_overlap_score(
-    query: str,
-    text: str,
-    *,
-    query_tokens: list[str] | None = None,
-    text_tokens: list[str] | None = None,
-) -> float:
-    query_tokens = query_tokens or tokenize_for_search(query)
-    text_tokens = text_tokens or tokenize_for_search(text)
-    if not query_tokens or not text_tokens:
-        return 0.0
+def hybrid_search_scores(query: str, texts: Sequence[str], *, embedding_backend: Any) -> list[float]:
+    clean_query = query.strip()
+    if not clean_query:
+        return [0.0 for _ in texts]
+    if embedding_backend is None:
+        raise RuntimeError("embedding_backend_not_configured")
 
-    query_counter = Counter(query_tokens)
-    text_counter = Counter(text_tokens)
-    total_weight = sum(len(token) * count for token, count in query_counter.items()) or 1
-    matched_weight = sum(
-        len(token) * min(count, text_counter.get(token, 0))
-        for token, count in query_counter.items()
-        if token in text_counter
-    )
-    coverage = matched_weight / total_weight
+    indexed_texts = [(index, text.strip()) for index, text in enumerate(texts)]
+    non_empty = [(index, text) for index, text in indexed_texts if text]
+    scores = [0.0 for _ in indexed_texts]
+    if not non_empty:
+        return scores
 
-    total_hits = sum(query_counter.values()) or 1
-    matched_hits = sum(min(count, text_counter.get(token, 0)) for token, count in query_counter.items())
-    density = matched_hits / total_hits
+    batch_fn = getattr(embedding_backend, "similarity_batch", None)
+    if callable(batch_fn):
+        raw_scores = list(batch_fn(clean_query, [text for _, text in non_empty]))
+    else:
+        single_fn = getattr(embedding_backend, "similarity", None)
+        if not callable(single_fn):
+            raise RuntimeError("embedding_backend_missing_similarity_methods")
+        raw_scores = [single_fn(clean_query, text) for _, text in non_empty]
 
-    lowered_query = query.lower().strip()
-    lowered_text = text.lower()
-    exact_bonus = 0.35 if lowered_query and lowered_query in lowered_text else 0.0
-    long_token_bonus = 0.15 if any(len(token) >= 4 and token in lowered_text for token in set(query_tokens)) else 0.0
-
-    return min(1.6, coverage * 0.7 + density * 0.3 + exact_bonus + long_token_bonus)
-
-
-def hash_vector(text_or_tokens: str | list[str], dim: int = 64) -> list[float]:
-    tokens = tokenize_for_search(text_or_tokens) if isinstance(text_or_tokens, str) else list(text_or_tokens)
-    if not tokens:
-        return [0.0] * dim
-
-    vec = [0.0] * dim
-    for token in tokens:
-        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-        value = int.from_bytes(digest, "big", signed=False)
-        for index in range(dim):
-            bit = (value >> (index % 63)) & 1
-            vec[index] += 1.0 if bit else -1.0
-
-    norm = math.sqrt(sum(item * item for item in vec)) or 1.0
-    return [item / norm for item in vec]
-
-
-def vector_cosine(left: list[float], right: list[float]) -> float:
-    if not left or not right:
-        return 0.0
-    dot = sum(x * y for x, y in zip(left, right))
-    left_norm = math.sqrt(sum(x * x for x in left))
-    right_norm = math.sqrt(sum(x * x for x in right))
-    if not left_norm or not right_norm:
-        return 0.0
-    return dot / (left_norm * right_norm)
+    for (index, _), score in zip(non_empty, raw_scores):
+        scores[index] = max(float(score), 0.0)
+    return scores
 
 
 def jaccard_similarity(left: str, right: str) -> float:
