@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from novel_agent.compaction import ContextCompactionManager, render_compact_summary_text
 from novel_agent.config import AgentConfig
 from novel_agent.controller import ControllerDependencies, NovelAgentController
 from novel_agent.embedding_index import EmbeddingIndexManager
 from novel_agent.memory import SessionState, SessionStore
 from novel_agent.registry import build_default_registry
+from novel_agent.toolbox import ToolExecutionResult, ToolHandler, ToolRuntimeContext
 from novel_agent.schemas import (
     BackendHealth,
     CompressionResult,
@@ -23,11 +26,12 @@ from novel_agent.workspace import WorkspaceManager
 
 
 class StubDecisionBackend:
-    def __init__(self, decisions, reviews=None, plans=None) -> None:
+    def __init__(self, decisions, reviews=None, plans=None, allowed_tools: tuple[str, ...] | None = None) -> None:
         if isinstance(decisions, list):
             self.decisions = list(decisions)
         else:
             self.decisions = [decisions]
+        self.allowed_tools = tuple(allowed_tools or ())
         if reviews is None:
             self.reviews = [DecisionReviewOutput(verdict="accept", reason="default_accept")]
         elif isinstance(reviews, list):
@@ -43,7 +47,7 @@ class StubDecisionBackend:
                     preferred_tool=(
                         decision.tool_name
                         if decision.action == "call_tool"
-                        and decision.tool_name in ("compress_chapter", "memory_search", "memory_get", "embedding_similarity")
+                        and decision.tool_name in self.allowed_tools
                         else None
                     ),
                 )
@@ -72,6 +76,8 @@ class StubDecisionBackend:
         messages,
         workspace_docs,
         session_summary,
+        tool_prompt_docs="",
+        tool_names=(),
         compacted_session_context="",
         recent_content_references="",
         loop_events=None,
@@ -86,6 +92,8 @@ class StubDecisionBackend:
         messages,
         workspace_docs,
         session_summary,
+        tool_prompt_docs="",
+        tool_names=(),
         compacted_session_context="",
         recent_content_references="",
         loop_events=None,
@@ -128,6 +136,8 @@ class StubDecisionBackend:
         messages,
         workspace_docs,
         session_summary,
+        tool_prompt_docs="",
+        tool_names=(),
         compacted_session_context="",
         recent_content_references="",
         loop_events=None,
@@ -197,7 +207,7 @@ class StubEmbeddingBackend:
         return torch.nn.functional.normalize(tensor, p=2, dim=1)
 
 
-def build_controller(tmp_path: Path, decisions, reviews=None, plans=None, **config_overrides):
+def build_controller(tmp_path: Path, decisions, reviews=None, plans=None, registry=None, **config_overrides):
     config = AgentConfig(
         workspace_root=tmp_path / "workspace",
         session_root=tmp_path / "sessions",
@@ -221,11 +231,12 @@ def build_controller(tmp_path: Path, decisions, reviews=None, plans=None, **conf
     meta_store.bootstrap()
     compaction_manager = ContextCompactionManager(config, session_store, meta_store)
     compaction_manager.bootstrap()
+    registry = registry or build_default_registry(config.tool_registry_enabled)
     deps = ControllerDependencies(
         config=config,
         workspace=workspace,
-        registry=build_default_registry(),
-        decision_backend=StubDecisionBackend(decisions, reviews=reviews, plans=plans),
+        registry=registry,
+        decision_backend=StubDecisionBackend(decisions, reviews=reviews, plans=plans, allowed_tools=registry.names()),
         compression_backend=StubCompressionBackend(),
         embedding_backend=embedding_backend,
         embedding_index_manager=embedding_index_manager,
@@ -300,6 +311,71 @@ def test_invalid_tool_name_is_blocked(tmp_path: Path):
     assert deps.compression_backend.last_request is None
 
 
+class FakeToolArgs(BaseModel):
+    topic: str
+
+
+class FakeToolHandler(ToolHandler):
+    name = "fake_tool"
+    description = "Fake tool for toolbox extensibility tests."
+    args_model = FakeToolArgs
+    prompt_doc = """
+## fake_tool
+
+- 名称：`fake_tool`
+- 作用：返回一个固定格式的测试结果
+- 输入：
+  - `topic`: 必填
+""".strip()
+
+    def execute(
+        self,
+        session: SessionState,
+        parsed_args: FakeToolArgs,
+        runtime: ToolRuntimeContext,
+    ) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            tool_name=self.name,
+            observation_text=f"topic={parsed_args.topic}",
+            payload={"topic": parsed_args.topic},
+            tool_trace={"requested_tool": self.name, "status": "ok"},
+            terminal=False,
+        )
+
+
+def test_tool_validation_error_is_wrapped_without_controller_branching(tmp_path: Path):
+    decision = DecisionOutput(
+        domain="novel",
+        action="call_tool",
+        tool_name="embedding_similarity",
+        tool_args={"query": "人物关系"},
+    )
+    controller, _ = build_controller(tmp_path, decision)
+    session = SessionState()
+
+    result = controller.handle_user_message(session, "比较这两段文本是不是相似")
+    assert result.action == "reject"
+    assert result.tool_trace["status"] == "invalid_args"
+    assert result.tool_trace["requested_tool"] == "embedding_similarity"
+
+
+def test_controller_can_dispatch_registered_fake_tool_without_new_branch(tmp_path: Path):
+    registry = build_default_registry()
+    registry.register(FakeToolHandler())
+    decision = DecisionOutput(
+        domain="novel",
+        action="call_tool",
+        tool_name="fake_tool",
+        tool_args={"topic": "角色弧光"},
+    )
+    controller, _ = build_controller(tmp_path, decision, registry=registry)
+    execution = controller._execute_tool(SessionState(), "fake_tool", {"topic": "角色弧光"})
+
+    assert execution.tool_name == "fake_tool"
+    assert execution.payload["topic"] == "角色弧光"
+    assert execution.observation_text == "topic=角色弧光"
+
+
 def test_novel_direct_reply_writes_memory(tmp_path: Path):
     decision = DecisionOutput(
         domain="novel",
@@ -317,7 +393,8 @@ def test_novel_direct_reply_writes_memory(tmp_path: Path):
     assert deps.decision_backend.calls == 1
     daily_file = deps.workspace.ensure_daily_file()
     assert "今天讨论了人物关系" in daily_file.read_text(encoding="utf-8")
-    assert "用户偏好关注人物关系" in (deps.workspace.root / "memory.md").read_text(encoding="utf-8")
+    context = deps.workspace.structured_memory.load_context()
+    assert "用户偏好关注人物关系" in context.user_preferences
 
 
 def test_model_drives_compress_tool_instead_of_controller_shortcut(tmp_path: Path):
@@ -399,8 +476,21 @@ def test_memory_search_can_happen_before_final_reply(tmp_path: Path):
 
 
 def test_direct_reply_review_can_trigger_retry_and_memory_lookup(tmp_path: Path):
+    plan = ExecutionPlanOutput(
+        user_goal="先检索历史压缩内容再回答",
+        steps=[
+            PlanStep(step_index=1, goal="检索第一次压缩内容", preferred_action="call_tool", preferred_tool="memory_search"),
+            PlanStep(step_index=2, goal="基于检索结果回答用户", preferred_action="direct_reply", preferred_tool=None),
+        ],
+    )
     decisions = [
-        DecisionOutput(domain="novel", action="direct_reply", assistant_reply="我猜第一次压缩是这个。"),
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="我猜第一次压缩是这个。",
+            needs_review=True,
+            review_reason="依赖历史事实，需要先复核",
+        ),
         DecisionOutput(
             domain="novel",
             action="call_tool",
@@ -413,7 +503,7 @@ def test_direct_reply_review_can_trigger_retry_and_memory_lookup(tmp_path: Path)
         DecisionReviewOutput(verdict="retry", reason="历史内容缺少证据，应先检索"),
         DecisionReviewOutput(verdict="accept", reason="已经检索"),
     ]
-    controller, deps = build_controller(tmp_path, decisions, reviews=reviews)
+    controller, deps = build_controller(tmp_path, decisions, reviews=reviews, plans=plan)
     session = deps.session_store.create_session()
     _append_compression_turn(deps, session, turn_index=1, user_content="请压缩第一章原文", assistant_content="第一次压缩结果")
     reloaded = deps.session_store.load_session(session.session_id)
@@ -423,11 +513,69 @@ def test_direct_reply_review_can_trigger_retry_and_memory_lookup(tmp_path: Path)
     assert result.reply == "第一次压缩结果是：第一次压缩结果"
     assert result.action == "call_tool"
     assert deps.decision_backend.calls == 3
+    assert deps.decision_backend.review_calls == 0
+    assert result.context_report["review_triggered"] is False
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert "premature_direct_reply_blocked" in event_types
+
+
+def test_risk_gated_review_skips_low_risk_direct_reply(tmp_path: Path):
+    controller, deps = build_controller(
+        tmp_path,
+        DecisionOutput(domain="novel", action="direct_reply", assistant_reply="这是直接回答。"),
+    )
+    result = controller.handle_user_message(SessionState(), "直接回答即可")
+    assert result.reply == "这是直接回答。"
+    assert deps.decision_backend.review_calls == 0
+    assert result.context_report["review_triggered"] is False
+
+
+def test_risk_gated_review_runs_when_decision_marks_high_risk(tmp_path: Path):
+    controller, deps = build_controller(
+        tmp_path,
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="这条回答需要复核。",
+            needs_review=True,
+            review_reason="涉及历史事实一致性",
+        ),
+        reviews=DecisionReviewOutput(verdict="accept", reason="evidence_sufficient"),
+    )
+    result = controller.handle_user_message(SessionState(), "请确认历史设定")
+    assert result.reply == "这条回答需要复核。"
     assert deps.decision_backend.review_calls == 1
     assert result.context_report["review_triggered"] is True
-    assert result.context_report["review_verdict"] == "retry"
-    event_types = [item["event_type"] for item in result.transcript_events]
-    assert "decision_review" in event_types
+    assert result.context_report["review_verdict"] == "accept"
+
+
+def test_review_mode_always_preserves_legacy_behavior(tmp_path: Path):
+    controller, deps = build_controller(
+        tmp_path,
+        DecisionOutput(domain="novel", action="direct_reply", assistant_reply="旧行为仍会复核。"),
+        reviews=DecisionReviewOutput(verdict="accept", reason="legacy"),
+        decision_review_mode="always",
+    )
+    controller.handle_user_message(SessionState(), "继续")
+    assert deps.decision_backend.review_calls == 1
+
+
+def test_review_mode_disabled_skips_review_even_for_high_risk(tmp_path: Path):
+    controller, deps = build_controller(
+        tmp_path,
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="即使高风险也不复核。",
+            needs_review=True,
+            review_reason="高风险",
+        ),
+        reviews=DecisionReviewOutput(verdict="retry", reason="should_not_run"),
+        decision_review_mode="disabled",
+    )
+    result = controller.handle_user_message(SessionState(), "继续")
+    assert result.reply == "即使高风险也不复核。"
+    assert deps.decision_backend.review_calls == 0
 
 
 def test_workspace_docs_no_longer_inject_auto_recall(tmp_path: Path):
@@ -575,6 +723,88 @@ def test_memory_get_default_observes_and_explicit_deliver_returns_full_text_to_u
     assert result.tool_trace["final_tool"] == "memory_get"
 
 
+def test_non_final_direct_reply_is_blocked_and_controller_continues_current_step(tmp_path: Path):
+    plan = ExecutionPlanOutput(
+        user_goal="先检索证据再回答",
+        steps=[
+            PlanStep(step_index=1, goal="先检索相关证据", preferred_action="call_tool", preferred_tool="memory_search"),
+            PlanStep(step_index=2, goal="基于证据回答用户", preferred_action="direct_reply", preferred_tool=None),
+        ],
+    )
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="我先直接猜一个答案。",
+        ),
+        DecisionOutput(
+            domain="novel",
+            action="call_tool",
+            tool_name="memory_search",
+            tool_args={"query": "人物关系"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="最终答案：之前讨论重点是人物关系。",
+        ),
+    ]
+    controller, deps = build_controller(tmp_path, decisions, plans=plan)
+    deps.workspace.append_long_term_entries(["之前讨论重点是人物关系"])
+
+    result = controller.handle_user_message(SessionState(), "我们之前重点讨论了什么？")
+
+    assert result.reply == "最终答案：之前讨论重点是人物关系。"
+    assert deps.decision_backend.calls == 3
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert "premature_direct_reply_blocked" in event_types
+    assert result.tool_trace["steps"][0]["requested_tool"] == "memory_search"
+
+
+def test_non_final_terminal_tool_is_deferred_to_observation_and_next_step_runs(tmp_path: Path):
+    plan = ExecutionPlanOutput(
+        user_goal="先读取压缩内容，再给结论",
+        steps=[
+            PlanStep(step_index=1, goal="读取最近一次压缩正文", preferred_action="call_tool", preferred_tool="memory_get"),
+            PlanStep(step_index=2, goal="回答是否已读取成功", preferred_action="direct_reply", preferred_tool=None),
+        ],
+    )
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            action="call_tool",
+            tool_name="memory_get",
+            tool_args={"target": "placeholder", "delivery_mode": "deliver"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            action="direct_reply",
+            assistant_reply="是，已经读取到最近一次压缩内容。",
+        ),
+    ]
+    controller, deps = build_controller(tmp_path, decisions, plans=plan)
+    session = deps.session_store.create_session()
+    _append_compression_turn(
+        deps,
+        session,
+        turn_index=1,
+        user_content="请压缩第一章原文",
+        assistant_content="这是第一次压缩后的完整章节内容。",
+    )
+    reloaded = deps.session_store.load_session(session.session_id)
+    assert reloaded is not None
+    deps.decision_backend.decisions[0].tool_args["target"] = f"session_compact:{session.session_id}#compression_history:0"
+
+    result = controller.handle_user_message(reloaded, "先读取最近一次压缩内容，再告诉我是否读取成功")
+
+    assert result.reply == "是，已经读取到最近一次压缩内容。"
+    assert deps.decision_backend.calls == 2
+    assert result.tool_trace["steps"][0]["requested_tool"] == "memory_get"
+    assert result.tool_trace.get("final_tool") is None
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert "terminal_tool_deferred" in event_types
+
+
 def test_planner_can_split_multi_step_count_question_into_observe_then_reply(tmp_path: Path):
     plan = ExecutionPlanOutput(
         user_goal="询问最近一次压缩输出字数",
@@ -680,7 +910,145 @@ def test_memory_get_observe_only_feeds_excerpt_back_to_model(tmp_path: Path):
     assert long_text not in rendered_loop
 
 
+def test_tool_only_plan_triggers_final_synthesis_direct_reply(tmp_path: Path):
+    plan = ExecutionPlanOutput(
+        user_goal="确认最后两次压缩内容是否相同",
+        steps=[
+            PlanStep(step_index=1, goal="获取最后两次压缩内容的文本", preferred_action="call_tool", preferred_tool="memory_get"),
+            PlanStep(step_index=2, goal="比较两次压缩内容是否为同一段文本", preferred_action="call_tool", preferred_tool="embedding_similarity"),
+        ],
+    )
+    repeated = "出了青仙古镇，叶辰踏上苍茫大地，一路思索。"
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            user_goal="确认最后两次压缩内容是否相同",
+            action="call_tool",
+            step_index=1,
+            tool_name="memory_get",
+            tool_args={"target": "placeholder"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            user_goal="确认最后两次压缩内容是否相同",
+            action="call_tool",
+            step_index=2,
+            tool_name="embedding_similarity",
+            tool_args={"query": repeated, "texts": [repeated, repeated], "top_k": 2},
+        ),
+        DecisionOutput(
+            domain="novel",
+            user_goal="确认最后两次压缩内容是否相同",
+            action="direct_reply",
+            assistant_reply="是，最后两次压缩内容相同。",
+        ),
+    ]
+    controller, deps = build_controller(tmp_path, decisions, plans=plan)
+    session = deps.session_store.create_session()
+    _append_compression_turn(deps, session, turn_index=1, user_content="请压缩第一章原文", assistant_content=repeated)
+    _append_compression_turn(deps, session, turn_index=2, user_content="请压缩第二章原文", assistant_content=repeated)
+    reloaded = deps.session_store.load_session(session.session_id)
+    assert reloaded is not None
+    deps.decision_backend.decisions[0].tool_args["target"] = f"session_compact:{session.session_id}#compression_history:1"
+
+    result = controller.handle_user_message(reloaded, "最后两次压缩内容是否相同？")
+
+    assert result.reply == "是，最后两次压缩内容相同。"
+    assert result.action == "call_tool"
+    assert deps.decision_backend.calls == 3
+    assert result.tool_trace["status"] == "final_synthesis_completed"
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert "final_synthesis_started" in event_types
+    assert "final_synthesis_completed" in event_types
+
+
+def test_final_synthesis_retries_once_when_first_attempt_does_not_direct_reply(tmp_path: Path):
+    plan = ExecutionPlanOutput(
+        user_goal="根据记忆给出结论",
+        steps=[PlanStep(step_index=1, goal="检索历史记忆", preferred_action="call_tool", preferred_tool="memory_search")],
+    )
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            user_goal="根据记忆给出结论",
+            action="call_tool",
+            step_index=1,
+            tool_name="memory_search",
+            tool_args={"query": "人物关系"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            user_goal="根据记忆给出结论",
+            action="call_tool",
+            tool_name="memory_search",
+            tool_args={"query": "人物关系"},
+        ),
+        DecisionOutput(
+            domain="novel",
+            user_goal="根据记忆给出结论",
+            action="direct_reply",
+            assistant_reply="最终结论：之前重点讨论的是人物关系。",
+        ),
+    ]
+    controller, deps = build_controller(tmp_path, decisions, plans=plan)
+    deps.workspace.append_long_term_entries(["之前重点讨论的是人物关系"])
+
+    result = controller.handle_user_message(SessionState(), "我们之前重点讨论了什么？")
+
+    assert result.reply == "最终结论：之前重点讨论的是人物关系。"
+    assert deps.decision_backend.calls == 3
+    event_types = [item["event_type"] for item in result.transcript_events]
+    assert "final_synthesis_retry" in event_types
+
+
+def test_final_synthesis_uses_structured_evidence_instead_of_full_text(tmp_path: Path):
+    long_text = "完整压缩内容" * 80
+    plan = ExecutionPlanOutput(
+        user_goal="基于读取内容给出结论",
+        steps=[PlanStep(step_index=1, goal="读取最近一次压缩内容", preferred_action="call_tool", preferred_tool="memory_get")],
+    )
+    decisions = [
+        DecisionOutput(
+            domain="novel",
+            action="call_tool",
+            tool_name="memory_get",
+            tool_args={"target": "placeholder"},
+        ),
+        DecisionOutput(domain="novel", action="direct_reply", assistant_reply="我已经基于证据完成最终回答。"),
+    ]
+    controller, deps = build_controller(tmp_path, decisions, plans=plan, memory_tool_max_chars=40)
+    session = deps.session_store.create_session()
+    _append_compression_turn(
+        deps,
+        session,
+        turn_index=1,
+        user_content="请压缩第一章原文",
+        assistant_content=long_text,
+    )
+    reloaded = deps.session_store.load_session(session.session_id)
+    assert reloaded is not None
+    deps.decision_backend.decisions[0].tool_args["target"] = f"session_compact:{session.session_id}#compression_history:0"
+
+    result = controller.handle_user_message(reloaded, "读取最近一次压缩内容，并给出结论")
+
+    assert result.reply == "我已经基于证据完成最终回答。"
+    rendered_loop = str(deps.decision_backend.last_loop_events)
+    assert "final_synthesis_evidence" in rendered_loop
+    assert "preview" in rendered_loop
+    assert long_text not in rendered_loop
+
+
 def test_recent_content_reference_alias_is_available_to_model_and_memory_get(tmp_path: Path):
+    plans = [
+        ExecutionPlanOutput(
+            user_goal="给出第一次压缩内容",
+            steps=[PlanStep(step_index=1, goal="直接读取并交付内容", preferred_action="call_tool", preferred_tool="memory_get")],
+        ),
+        ExecutionPlanOutput(
+            user_goal="继续引用最近内容",
+            steps=[PlanStep(step_index=1, goal="基于最近内容继续回答", preferred_action="direct_reply", preferred_tool=None)],
+        ),
+    ]
     decisions = [
         DecisionOutput(
             domain="novel",
@@ -690,7 +1058,7 @@ def test_recent_content_reference_alias_is_available_to_model_and_memory_get(tmp
         ),
         DecisionOutput(domain="novel", action="direct_reply", assistant_reply="我已经看到最近内容引用。"),
     ]
-    controller, deps = build_controller(tmp_path, decisions)
+    controller, deps = build_controller(tmp_path, decisions, plans=plans)
     session = deps.session_store.create_session()
     _append_compression_turn(
         deps,

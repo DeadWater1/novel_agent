@@ -149,10 +149,10 @@ def test_idle_heartbeat_writes_memory_and_clears_dirty_flags(tmp_path: Path):
     assert embedding_index_manager.workspace_shard_path().exists()
 
     daily_content = workspace.ensure_daily_file().read_text(encoding="utf-8")
-    long_term_content = (workspace.root / "memory.md").read_text(encoding="utf-8")
+    context = workspace.structured_memory.load_context()
     assert "今天执行了 1 次章节压缩任务" in daily_content
-    assert "用户偏好压缩时保留人物关系" in long_term_content
-    assert "用户偏好压缩时保留剧情顺序" in long_term_content
+    assert "用户偏好压缩时保留人物关系" in context.user_preferences
+    assert "用户偏好压缩时保留剧情顺序" in context.user_preferences
     artifact = compaction_manager.load_compaction(session.session_id)
     assert artifact is not None
     assert artifact.compression_history

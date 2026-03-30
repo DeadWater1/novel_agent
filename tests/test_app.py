@@ -52,8 +52,8 @@ def test_render_chat_html_contains_both_messages():
 
 
 def test_render_hero_only_shows_app_title():
-    html = _render_hero("Novel Agent V4")
-    assert "Novel Agent V4" in html
+    html = _render_hero("Novel Agent V5")
+    assert "Novel Agent V5" in html
     assert "Closed-Domain Novel Agent" not in html
     assert "Markdown Memory" not in html
 
@@ -86,6 +86,32 @@ def test_render_loop_trace_shows_plan_events():
     assert "Plan Created" in html
     assert "Step Completed" in html
     assert "Plan Updated" in html
+
+
+def test_render_loop_trace_shows_early_finish_guard_events():
+    html = _render_loop_trace(
+        [
+            {"event_type": "premature_direct_reply_blocked", "step_index": 1},
+            {"event_type": "terminal_tool_deferred", "step_index": 1, "tool_name": "memory_get"},
+        ]
+    )
+    assert "Direct Reply Blocked" in html
+    assert "Terminal Tool Deferred" in html
+
+
+def test_render_loop_trace_shows_final_synthesis_events():
+    html = _render_loop_trace(
+        [
+            {"event_type": "final_synthesis_started", "step_index": 3},
+            {"event_type": "final_synthesis_evidence", "step_index": 3},
+            {"event_type": "final_synthesis_retry", "step_index": 3},
+            {"event_type": "final_synthesis_failed", "step_index": 3},
+        ]
+    )
+    assert "Final Synthesis" in html
+    assert "Synthesis Evidence" in html
+    assert "Synthesis Retry" in html
+    assert "Synthesis Failed" in html
 
 
 def test_render_decision_output_wraps_body_with_decision_scroll_container():

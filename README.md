@@ -1,117 +1,102 @@
-# Novel Agent V4
+# Novel Agent V5
 
-封闭式小说 Agent 的 V4 版本，面向“小说域对话 + 章节压缩 + 可检索会话记忆 + 计划化多步执行”场景。
+封闭式小说 Agent 的 V5 版本，面向“小说域对话 + 章节压缩 + 可检索会话记忆 + 计划化多步执行”场景。
 
 当前版本继续坚持两个边界：
 
 - 只服务小说相关任务
 - 小说域外统一返回 `无法回答`
 
-## V4 更新
+## V5 更新
 
-相较于 `v3.0.0`，V4 的核心变化不是继续堆工具，而是把 agent 主链从“单步决策 loop”升级成了“显式计划 + 按 step 执行”的模型主导流程。
+相较于 `v4.0.0`，V5 的核心变化是把 agent 从“能规划、能调工具”继续推进到“更稳地执行、更稳地收口、底层更易扩展”。
 
-### 1. 从“单步决策”升级为“先计划、再执行”
+### 1. Toolbox 升级为可扩展框架
 
-- 每个用户问题都会先触发一次 `plan_turn(...)`
-  - 决策模型先输出 `ExecutionPlanOutput`
-  - 计划里显式列出 `steps`
-- controller 不再直接一轮只产出一个动作
-  - 现在会维护当前 step
-  - 会维护已完成 step
-  - 会按计划逐步推进
-- 执行中允许一次 `plan_update`
-  - 如果模型判断原计划不合理，可以重规划剩余步骤
+- 工具系统不再把工具名写死在 prompt / schema / controller
+- `ToolRegistry` 现在成为工具元数据单一真源
+- 每个工具拥有独立 `Args model + handler + prompt_doc`
+- 新增第 5 个工具时，不需要再改 controller 分支或 prompt 常量
 
-### 2. 保留 review，但职责升级为“证据检查 + 计划完成度检查”
+### 2. 自动记忆改为结构化主存储
 
-- V4 仍然保留一次隐藏 review
-- review 不再只看“首答证据够不够”
-- 现在还会检查：
-  - 当前回答是否在计划完成前过早结束
-  - 当前 step 是否真的完成
-- `retry` 时仍然不会由 controller 强行指定工具，仍然交回给模型自己重新判断
+- 人工长期规则继续常驻：
+  - `agent.md`
+  - `identity.md`
+  - `user.md`
+  - `soul.md`
+- 自动历史记忆不再默认注入 prompt
+- 自动 memory 迁移到：
+  - `runtime/structured_memory/context.json`
+  - `runtime/structured_memory/facts.jsonl`
+  - `runtime/structured_memory/digests/YYYY-MM-DD.md`
+- `memory_search` / `memory_get` 继续由模型自行决定是否调用
 
-### 3. `memory_get` 从“默认直接交付”改成“默认 observe”
+### 3. 提前结束保护与最终收口补齐
 
-- `memory_get` 默认值已改为：
-  - `delivery_mode="observe"`
-- 这意味着：
-  - 默认先读内容
-  - 把 observation 节选回给模型
-  - 是否要把全文真正交付给用户，由模型显式决定
-- 只有模型明确传：
-  - `delivery_mode="deliver"`
-  才会把全文直接返回给前端
+- 未完成 plan 时，`direct_reply` 不允许提前结束整轮
+- 当前 plan 后面还有步骤时，`terminal tool` 会降级为 observation，而不是直接把结果交付用户
+- 当本轮已经发生过工具调用，且 plan 已执行到末尾时，controller 会自动进入一次 `final synthesis`
+- `final synthesis` 会把：
+  - 用户原问题
+  - 当前上下文
+  - 已完成步骤
+  - 结构化工具证据
+  再喂给 decision，强制生成最终 `direct_reply`
+- 若第一次收口失败，会自动再试一次，避免直接落入 `plan_exhausted`
 
-这一步是为了更自然地支持多步计划，例如：
+### 4. 证据回喂改成“结构化证据优先”
 
-1. 先 `memory_get(observe)` 读取最近一次压缩结果  
-2. 再 `direct_reply` 返回“总共有多少字”
+- 工具结果不会默认把所有全文重新塞回 decision
+- 优先回喂：
+  - `memory_get` 的 `target / resolved_target / source_path / content_length / preview`
+  - `memory_search` 的 `target / score / snippet / summary_preview`
+  - `embedding_similarity` 的 `candidate_count / top_score / best_match_index / exact_match`
+- 上下文超预算时，优先裁剪旧 loop events 和长 preview，只对本轮相关证据做局部摘要
 
-### 4. Prompt 进一步去路径化，强化模型自主决策
+### 5. 生成链支持本地 vLLM
 
-- 删除了 prompt 中那类“先 recap / lookup”“证据不足就 call_tool”的路径引导语
-- 不再让 prompt 预先替模型规划动作顺序
-- 新增单独的 planning prompt
-  - 只负责拆分子任务
-  - 不负责直接给最终答案
-- 决策 prompt 改成“执行当前 step”
+- 文本生成链支持：
+  - `local`
+  - `vllm`
+- `decision / review / summary / compression` 可以走本地 vLLM
+- embedding 仍保持本地独立实现
+- 当前默认 review 模式为 `risk_gated`
+- 当前 loop 上限提升到 `16`
 
-### 5. 去掉 auto recall，是否检索交给模型自己决定
-
-- `ContextEngine` 不再在每轮决策前自动替模型做一次 `current_session` recall
-- 现在：
-  - 查不查记忆
-  - 查哪一层历史
-  - 是否需要 `memory_search`
-  都由决策模型自己决定
-
-### 6. UI 同步升级为“计划优先”
-
-- 右侧 `LOOP` 面板新增：
-  - `Plan Created`
-  - `Plan Updated`
-  - `Step Completed`
-- 右侧“决策模型输出”窗口现在分开展示：
-  - `Planner Output`
-  - `Decision Output`
-  - `Review Output`
-- 首页标题升级为 `Novel Agent V4`
-
-## 相比 V3 的核心增删改
+## 相比 V4 的核心增删改
 
 ### 新增
 
-- `PlanStep`
-- `ExecutionPlanOutput`
-- `decision_backend.plan_turn(...)`
-- planner 原始输出展示
-- plan 事件：
-  - `plan_created`
-  - `plan_updated`
-  - `plan_step_completed`
+- 可扩展 toolbox handler / registry 框架
+- structured memory 主存储
+- final synthesis 收口阶段
+- vLLM generation backend
+- plan 执行保护事件：
+  - `premature_direct_reply_blocked`
+  - `terminal_tool_deferred`
+  - `final_synthesis_started`
+  - `final_synthesis_retry`
+  - `final_synthesis_completed`
+  - `final_synthesis_failed`
 
 ### 重构
 
 - `novel_agent/controller.py`
-  - 从“单步决策 + 工具执行”重构为“计划阶段 + 执行阶段”
-- `novel_agent/backends/decision.py`
-  - 新增 planner 调用
-  - 保留 planner / decision / review 三类原始输出
+  - 从“按计划执行”升级为“按计划执行 + 工具后强制收口”
+- `novel_agent/backends/decision.py` / `novel_agent/backends/vllm_backend.py`
+  - 支持 final synthesis 场景的最终答复生成
 - `novel_agent/prompts.py`
-  - 拆成 planning prompt、execution prompt、review prompt
-- `novel_agent/app.py`
-  - Loop UI 改成可视化计划执行
-  - 决策输出面板增加 planner 原始输出
+  - 强化判断型问题必须保留最终回答出口
+- `novel_agent/workspace.py`
+  - 自动 memory 改为 structured memory 读取与检索
 
 ### 删除或替换
 
-- 删除 prompt 中对工具路径的强引导句
-- 删除 auto recall 的预检索行为
-- 替换 V3 中 `memory_get` 默认直接交付全文的行为
-  - 现在默认 `observe`
-  - 显式 `deliver` 才会全文直返
+- 移除 Ollama 方案，统一改为 `local / vllm`
+- daily markdown 不再是自动 memory 真源
+- 替换“工具执行完即自然结束”的链路
+  - 现在必须经过最终收口或终局工具结束
 
 ## 当前能力
 
@@ -119,7 +104,7 @@
 
 - 决策模型默认使用本地 `Qwen3-14B`
 - 默认 GPU + bf16 优先加载
-- 已支持显式 plan -> execute 的多步 agent loop
+- 已支持显式 plan -> execute -> final synthesis 的多步 agent loop
 
 ### 2. 章节压缩
 
@@ -141,10 +126,12 @@
   - 显式 `deliver` 时才全文交付
   - 支持：
     - `long_term`
-    - `daily_latest`
-    - `today`
-    - `yesterday`
-    - `daily:YYYY-MM-DD`
+    - `context:user_preferences`
+    - `context:story_constraints`
+    - `context:open_loops`
+    - `fact:MEMORY_ID`
+    - `digest:YYYY-MM-DD`
+    - `daily_latest / today / yesterday / daily:YYYY-MM-DD`（兼容映射）
     - `session:...`
     - `session_compact:...`
     - `content_ref:latest`
@@ -169,29 +156,33 @@
   - `runtime/compactions/`
 - Embedding shards：
   - `runtime/embeddings/`
+- Structured memory：
+  - `runtime/structured_memory/`
 - Session transcript：
   - `runtime/sessions/`
 
 ## 运行结构
 
-- `novel_agent/app.py`
-  - Gradio UI 与启动入口
 - `novel_agent/controller.py`
-  - planning / execution loop、工具执行、review、memory_get 行为
+  - planning / execution loop、工具执行、review、final synthesis
 - `novel_agent/context_engine.py`
   - 上下文预算、pruning、memory flush、compaction 装配
+- `novel_agent/toolbox.py`
+  - 工具 handler、参数模型与执行分发
 - `novel_agent/compaction.py`
   - compact artifact、compression ledger、transcript snapshot
 - `novel_agent/embedding_index.py`
   - 本地 embedding shard 缓存与查询
 - `novel_agent/backends/decision.py`
   - planner / decision / review 模型加载与推理
+- `novel_agent/backends/vllm_backend.py`
+  - vLLM 本地推理后端
 - `novel_agent/backends/compression.py`
   - 压缩模型加载与推理
 - `novel_agent/backends/embedding.py`
   - embedding 模型加载与相似度计算
 - `novel_agent/workspace.py`
-  - workspace 文档、Markdown memory、memory access
+  - workspace 文档、structured memory、memory access
 - `novel_agent/memory.py`
   - session transcript 与会话恢复
 - `novel_agent/heartbeat.py`
@@ -207,7 +198,6 @@
 - `workspace/soul.md`
 - `workspace/user.md`
 - `workspace/memory.md`
-- `workspace/memory/YYYY-MM-DD.md`
 
 ### Runtime
 
@@ -215,6 +205,7 @@
 - `runtime/transcripts/`
 - `runtime/compactions/`
 - `runtime/embeddings/`
+- `runtime/structured_memory/`
 
 ## 启动
 
@@ -243,8 +234,11 @@ python -m pytest -q tests
 - 决策预算：
   - `decision_input_token_budget = 32768`
   - `decision_output_max_new_tokens = 4096`
+- vLLM：
+  - `vllm_gpu_memory_utilization = 0.5`
+  - `vllm_max_model_len = 32768`
 - loop 上限：
-  - `agent_max_loop_steps = 6`
+  - `agent_max_loop_steps = 16`
 - 上下文阈值：
   - `context_memory_flush_soft_threshold = 28672`
   - `context_pruning_soft_budget = 30720`
@@ -256,7 +250,8 @@ python -m pytest -q tests
 - 当前仍然只有单 Agent 执行，不做多 agent 并行
 - 没有联网搜索
 - 没有外部向量数据库
-- 计划是 turn-local 的，不跨多个用户回合持久延续
+- 计划仍然是 turn-local 的，不跨多个用户回合持久延续
+- final synthesis 仍依赖 decision 模型生成最终结论，不做 controller 模板化保底
 
 ## 版本说明
 
@@ -267,4 +262,6 @@ python -m pytest -q tests
 - `v3.0.0`
   - 模型主导 loop、32K 上下文引擎、分层 memory retrieval、compaction/runtime artifacts
 - `v4.0.0`
-  - 显式 planner、多步计划执行、单次重规划、review 检查计划完成度、`memory_get` 默认 observe、planner UI 可视化
+  - 显式 planner、多步计划执行、单次重规划、review 检查计划完成度、`memory_get` 默认 observe
+- `v5.0.0`
+  - 可扩展 toolbox、structured memory、提前结束保护、工具后强制收口、vLLM backend、loop 上限 16

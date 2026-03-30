@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 from novel_agent.config import AgentConfig
@@ -100,13 +101,48 @@ def test_memory_search_and_memory_get_are_available(tmp_path: Path):
 
     results = workspace.memory_search("人物关系", max_results=3)
     assert results
-    assert results[0]["source_id"] == "long_term"
-    assert str(results[0]["target"]).startswith("long_term#L")
+    assert any("人物关系" in str(item.get("snippet", "")) or "人物关系" in str(item.get("content", "")) for item in results)
+    assert str(results[0]["target"]).startswith(("context:user_preferences#L", "fact:"))
+    assert str(results[0]["source_id"]).startswith(("context:user_preferences", "fact:"))
 
     latest_daily = workspace.memory_get("daily_latest")
     assert latest_daily["target"] == "daily_latest"
+    assert latest_daily["resolved_target"].startswith("digest:")
     assert "今天讨论了剧情推进" in latest_daily["content"]
 
-    ranged = workspace.memory_get(str(results[0]["target"]))
-    assert ranged["resolved_target"].startswith("long_term#L")
+    ranged = workspace.memory_get(str(results[0]["source_id"]))
+    assert ranged["resolved_target"].startswith(("context:user_preferences", "fact:"))
     assert "人物关系" in ranged["content"]
+
+
+def test_structured_memory_fact_target_and_daily_compat_mapping(tmp_path: Path):
+    config = AgentConfig(
+        workspace_root=tmp_path / "workspace",
+        session_root=tmp_path / "sessions",
+        embedding_index_root=tmp_path / "runtime" / "embeddings",
+        structured_memory_root=tmp_path / "runtime" / "structured_memory",
+    )
+    embedding_backend = StubEmbeddingBackend()
+    embedding_index_manager = EmbeddingIndexManager(config, embedding_backend)
+    embedding_index_manager.bootstrap()
+    workspace = WorkspaceManager(
+        config,
+        embedding_backend=embedding_backend,
+        embedding_index_manager=embedding_index_manager,
+    )
+    workspace.bootstrap()
+    workspace.append_long_term_entries(["世界观设定：北境常年严寒。"])
+    workspace.append_daily_entries(["今天讨论了世界观设定"])
+
+    results = workspace.memory_search("北境严寒", max_results=3)
+    assert results
+    fact_target = str(results[0]["source_id"])
+    assert fact_target.startswith("fact:")
+
+    fact_doc = workspace.memory_get(fact_target)
+    assert fact_doc["resolved_target"].startswith("fact:")
+    assert "北境常年严寒" in fact_doc["content"]
+
+    day_text = date.today().isoformat()
+    compat_daily = workspace.memory_get(f"daily:{day_text}")
+    assert compat_daily["resolved_target"] == f"digest:{day_text}"

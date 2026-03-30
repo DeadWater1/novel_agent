@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from .backends import LocalCompressionBackend, LocalDecisionBackend, LocalEmbeddingBackend, LocalSummaryBackend
+from .backends import LocalEmbeddingBackend, build_generation_backends
 from .compaction import ContextCompactionManager
 from .config import AgentConfig
 from .controller import ControllerDependencies, NovelAgentController
@@ -22,25 +22,26 @@ DEFAULT_SERVER_PORT_CANDIDATES = (7860, 7861, 7862, 9888, 9988, 17860, 27860)
 
 APP_CSS = """
 :root {
-  --paper-1: #f7efe2;
-  --paper-2: #fff8ef;
-  --paper-3: rgba(255, 250, 241, 0.84);
-  --ink-1: #000000;
-  --ink-2: #000000;
-  --line: rgba(125, 98, 70, 0.18);
-  --accent: #000000;
-  --accent-soft: rgba(178, 90, 44, 0.12);
-  --olive: #000000;
-  --olive-soft: rgba(47, 93, 81, 0.12);
-  --shadow: 0 24px 60px rgba(75, 55, 33, 0.10);
+  --paper-1: #050505;
+  --paper-2: #0b0908;
+  --paper-3: rgba(20, 16, 13, 0.92);
+  --ink-1: #ffffff;
+  --ink-2: rgba(255, 255, 255, 0.82);
+  --line: rgba(255, 255, 255, 0.08);
+  --accent: #ffffff;
+  --accent-soft: rgba(255, 255, 255, 0.08);
+  --olive: #ffffff;
+  --olive-soft: rgba(255, 255, 255, 0.08);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.42);
 }
 
 body,
 .gradio-container {
   background:
-    radial-gradient(circle at top left, rgba(222, 192, 138, 0.34), transparent 34%),
-    radial-gradient(circle at top right, rgba(107, 147, 135, 0.18), transparent 26%),
-    linear-gradient(180deg, #fbf4e8 0%, #f5ede0 100%);
+    radial-gradient(circle at top left, rgba(180, 128, 52, 0.10), transparent 30%),
+    radial-gradient(circle at top center, rgba(117, 70, 36, 0.10), transparent 24%),
+    radial-gradient(circle at right center, rgba(255, 255, 255, 0.03), transparent 28%),
+    linear-gradient(180deg, #050505 0%, #080706 52%, #040404 100%);
   color: var(--ink-1);
   font-family: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", sans-serif;
 }
@@ -48,6 +49,10 @@ body,
 .gradio-container {
   max-width: 1560px !important;
   padding: 24px 20px 32px !important;
+}
+
+.gradio-container * {
+  color: var(--ink-1);
 }
 
 .block-title {
@@ -63,7 +68,7 @@ body,
   background: var(--paper-3);
   border-radius: 24px;
   box-shadow: var(--shadow);
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(14px);
 }
 
 .hero-card {
@@ -76,8 +81,9 @@ body,
   gap: 28px;
   padding: 28px;
   background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.08)),
-    linear-gradient(120deg, rgba(178, 90, 44, 0.10), rgba(47, 93, 81, 0.08));
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01)),
+    radial-gradient(circle at top left, rgba(175, 125, 56, 0.12), transparent 34%),
+    linear-gradient(120deg, rgba(65, 46, 30, 0.32), rgba(12, 10, 9, 0.18));
 }
 
 .hero-copy {
@@ -90,7 +96,8 @@ body,
   gap: 8px;
   padding: 6px 12px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.60);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
   color: var(--accent);
   font-size: 12px;
   font-weight: 700;
@@ -162,9 +169,9 @@ body,
 .composer-input textarea {
   min-height: 76px !important;
   padding: 18px 18px 14px !important;
-  border: 1px solid rgba(125, 98, 70, 0.16) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
   border-radius: 18px !important;
-  background: rgba(255, 255, 255, 0.84) !important;
+  background: rgba(255, 255, 255, 0.04) !important;
   color: var(--ink-1) !important;
   font-size: 15px !important;
   line-height: 1.68 !important;
@@ -172,8 +179,8 @@ body,
 }
 
 .composer-input textarea::placeholder {
-  color: #000000 !important;
-  opacity: 0.72 !important;
+  color: rgba(255, 255, 255, 0.48) !important;
+  opacity: 1 !important;
 }
 
 .send-btn button,
@@ -184,27 +191,28 @@ body,
 }
 
 .send-btn button {
-  background: linear-gradient(135deg, #efc5a9, #e6b898) !important;
-  border: none !important;
-  color: #000000 !important;
+  background: linear-gradient(135deg, #2b231b, #181311) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: #ffffff !important;
 }
 
 .ghost-btn button {
-  background: rgba(255, 255, 255, 0.68) !important;
-  border: 1px solid rgba(125, 98, 70, 0.18) !important;
-  color: #000000 !important;
+  background: rgba(255, 255, 255, 0.04) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: #ffffff !important;
 }
 
 .chat-shell {
   height: 760px;
   padding: 22px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.06)),
-    linear-gradient(180deg, #fffdf9 0%, #fbf5eb 100%);
+    radial-gradient(circle at top center, rgba(186, 128, 60, 0.06), transparent 24%),
+    linear-gradient(180deg, rgba(17, 14, 12, 0.94), rgba(8, 7, 7, 0.98)),
+    linear-gradient(180deg, #0b0a09 0%, #050505 100%);
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
-  scrollbar-color: rgba(0, 0, 0, 0.25) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .chat-shell::-webkit-scrollbar {
@@ -212,7 +220,7 @@ body,
 }
 
 .chat-shell::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.22);
+  background: rgba(255, 255, 255, 0.18);
   border-radius: 999px;
 }
 
@@ -227,11 +235,11 @@ body,
   justify-content: center;
   min-height: 100%;
   padding: 28px;
-  border: 1px dashed rgba(125, 98, 70, 0.22);
+  border: 1px dashed rgba(255, 255, 255, 0.12);
   border-radius: 24px;
   background:
-    radial-gradient(circle at top right, rgba(178, 90, 44, 0.08), transparent 28%),
-    rgba(255, 255, 255, 0.64);
+    radial-gradient(circle at top right, rgba(178, 109, 54, 0.10), transparent 28%),
+    rgba(255, 255, 255, 0.02);
 }
 
 .chat-empty-kicker {
@@ -282,26 +290,26 @@ body,
   max-width: min(92%, 980px);
   padding: 14px 16px 13px;
   border-radius: 22px;
-  border: 1px solid rgba(125, 98, 70, 0.14);
-  box-shadow: 0 14px 30px rgba(75, 55, 33, 0.08);
-  color: #000000 !important;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.26);
+  color: #ffffff !important;
 }
 
 .chat-bubble *,
 .chat-meta,
 .chat-content {
-  color: #000000 !important;
+  color: #ffffff !important;
 }
 
 .chat-row.user .chat-bubble {
-  background: linear-gradient(135deg, #f4d9c4, #efcbb0);
-  color: #000000;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.05));
+  color: #ffffff;
   border-bottom-right-radius: 8px;
 }
 
 .chat-row.assistant .chat-bubble {
-  background: rgba(255, 255, 255, 0.86);
-  color: #000000;
+  background: rgba(255, 255, 255, 0.04);
+  color: #ffffff;
   border-bottom-left-radius: 8px;
 }
 
@@ -313,11 +321,11 @@ body,
 }
 
 .chat-row.user .chat-meta {
-  color: #000000;
+  color: rgba(255, 255, 255, 0.72);
 }
 
 .chat-row.assistant .chat-meta {
-  color: #000000;
+  color: rgba(255, 255, 255, 0.72);
 }
 
 .chat-content {
@@ -343,7 +351,7 @@ body,
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
-  scrollbar-color: rgba(0, 0, 0, 0.22) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .panel-body-scroll::-webkit-scrollbar {
@@ -351,7 +359,7 @@ body,
 }
 
 .panel-body-scroll::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.20);
+  background: rgba(255, 255, 255, 0.18);
   border-radius: 999px;
 }
 
@@ -410,8 +418,8 @@ body,
 .loop-item {
   padding: 14px;
   border-radius: 18px;
-  border: 1px solid rgba(125, 98, 70, 0.14);
-  background: rgba(255, 255, 255, 0.70);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .status-top,
@@ -445,17 +453,17 @@ body,
 .status-pill.ok,
 .loop-pill.done {
   background: var(--olive-soft);
-  color: var(--olive);
+  color: #ffffff;
 }
 
 .status-pill.error {
-  background: rgba(188, 58, 58, 0.12);
-  color: #000000;
+  background: rgba(188, 58, 58, 0.22);
+  color: #ffffff;
 }
 
 .loop-pill.step {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: #ffffff;
 }
 
 .status-detail,
@@ -474,8 +482,8 @@ body,
   margin-bottom: 10px;
   padding: 5px 10px;
   border-radius: 999px;
-  background: rgba(47, 93, 81, 0.10);
-  color: var(--olive);
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -488,8 +496,17 @@ body,
 
 .thinking-card textarea {
   border-radius: 18px !important;
-  background: rgba(255, 255, 255, 0.74) !important;
-  color: #000000 !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  background: rgba(255, 255, 255, 0.04) !important;
+  color: #ffffff !important;
+}
+
+button:hover,
+.chat-bubble:hover,
+.status-item:hover,
+.memory-block:hover,
+.loop-item:hover {
+  filter: brightness(1.06);
 }
 
 @media (max-width: 1024px) {
@@ -640,7 +657,7 @@ def _import_gradio() -> Any:
 
 class NovelAgentApplication:
     def __init__(self, config: AgentConfig | None = None) -> None:
-        self.config = config or AgentConfig()
+        self.config = config or AgentConfig.from_env()
         self.embedding_backend = LocalEmbeddingBackend(self.config)
         self.embedding_index_manager = EmbeddingIndexManager(self.config, self.embedding_backend)
         self.embedding_index_manager.bootstrap()
@@ -654,10 +671,8 @@ class NovelAgentApplication:
         self.session_store.bootstrap()
         self.meta_store = SessionMetaStore(self.config.session_root)
         self.meta_store.bootstrap()
-        self.registry = build_default_registry()
-        self.decision_backend = LocalDecisionBackend(self.config)
-        self.compression_backend = LocalCompressionBackend(self.config)
-        self.summary_backend = LocalSummaryBackend(self.config, shared_backend=self.decision_backend)
+        self.registry = build_default_registry(self.config.tool_registry_enabled)
+        self.decision_backend, self.compression_backend, self.summary_backend = build_generation_backends(self.config)
         self.compaction_manager = ContextCompactionManager(
             self.config,
             self.session_store,
@@ -899,6 +914,32 @@ def _render_loop_trace(events: list[dict[str, Any]]) -> str:
             verdict = payload.get("verdict", "accept")
             detail = "首答通过复审" if verdict == "accept" else "首答被要求重试"
             items.append(_render_loop_item(f"Step {step_index}", "Review", detail))
+            continue
+
+        if event_type == "premature_direct_reply_blocked":
+            items.append(_render_loop_item(f"Step {step_index}", "Direct Reply Blocked", "当前计划尚未完成，阻止提前结束"))
+            continue
+
+        if event_type == "terminal_tool_deferred":
+            tool_name = event.get("tool_name", "")
+            detail = f"{tool_name} 已返回结果，但当前仅作为 observation 继续后续步骤" if tool_name else "终局工具结果被降级为 observation"
+            items.append(_render_loop_item(f"Step {step_index}", "Terminal Tool Deferred", detail))
+            continue
+
+        if event_type == "final_synthesis_started":
+            items.append(_render_loop_item(f"Step {step_index}", "Final Synthesis", "基于已有工具证据生成最终答复"))
+            continue
+
+        if event_type == "final_synthesis_evidence":
+            items.append(_render_loop_item(f"Step {step_index}", "Synthesis Evidence", "向决策模型回喂结构化工具证据"))
+            continue
+
+        if event_type == "final_synthesis_retry":
+            items.append(_render_loop_item(f"Step {step_index}", "Synthesis Retry", "首次收口未成功，重试最终答复"))
+            continue
+
+        if event_type == "final_synthesis_failed":
+            items.append(_render_loop_item(f"Step {step_index}", "Synthesis Failed", "工具证据已回喂，但最终答复仍未生成"))
             continue
 
         if event_type == "assistant_message":

@@ -8,6 +8,7 @@ from pathlib import Path
 from .config import AgentConfig
 from .embedding_index import EmbeddingIndexItem
 from .search_utils import extract_snippet, format_line_target, hybrid_search_scores, mmr_rerank, recency_multiplier
+from .structured_memory import MemoryContext, MemoryDigest, MemoryFact, StructuredMemoryStore
 
 
 WORKSPACE_FILE_ORDER = (
@@ -58,6 +59,7 @@ class WorkspaceManager:
         self.config = config
         self.root = Path(config.workspace_root)
         self.daily_root = self.root / "memory"
+        self.structured_memory = StructuredMemoryStore(Path(config.structured_memory_root))
         self.embedding_backend = embedding_backend
         self.embedding_index_manager = embedding_index_manager
 
@@ -70,6 +72,7 @@ class WorkspaceManager:
     def bootstrap(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.daily_root.mkdir(parents=True, exist_ok=True)
+        self.structured_memory.bootstrap()
         for name, content in WORKSPACE_DEFAULTS.items():
             path = self.root / name
             if not path.exists():
@@ -78,9 +81,9 @@ class WorkspaceManager:
 
     def ensure_daily_file(self, day: date | None = None) -> Path:
         target_day = day or date.today()
-        path = self.daily_root / f"{target_day.isoformat()}.md"
+        path = self.structured_memory.digest_path(target_day)
         if not path.exists():
-            path.write_text(f"# Daily Memory - {target_day.isoformat()}\n\n", encoding="utf-8")
+            self.structured_memory.save_digest(MemoryDigest(date=target_day.isoformat(), lines=[]))
         return path
 
     def read_file(self, relative_name: str) -> str:
@@ -107,31 +110,38 @@ class WorkspaceManager:
         today = date.today()
         for offset in range(self.config.daily_memory_lookback_days):
             target = today - timedelta(days=offset)
-            path = self.ensure_daily_file(target)
-            results.append(path.read_text(encoding="utf-8").strip())
+            digest = self.structured_memory.load_digest(target)
+            results.append(self._render_digest_text(digest))
         return results
 
     def append_daily_entries(self, entries: list[str], day: date | None = None) -> None:
-        clean_entries = self._dedupe_entries(entries, self.ensure_daily_file(day))
-        if not clean_entries:
-            return
-        path = self.ensure_daily_file(day)
-        current = path.read_text(encoding="utf-8")
-        with path.open("w", encoding="utf-8") as handle:
-            handle.write(current.rstrip() + "\n\n")
-            for entry in clean_entries:
-                handle.write(f"- {entry}\n")
+        self.structured_memory.append_digest_entries(entries, day=day)
 
     def append_long_term_entries(self, entries: list[str]) -> None:
-        clean_entries = self._dedupe_entries(entries, self.root / "memory.md")
+        clean_entries = [entry.strip() for entry in entries if entry and entry.strip()]
         if not clean_entries:
             return
-        path = self.root / "memory.md"
-        current = path.read_text(encoding="utf-8") if path.exists() else self.config.long_term_memory_header
-        with path.open("w", encoding="utf-8") as handle:
-            handle.write(current.rstrip() + "\n\n")
-            for entry in clean_entries:
-                handle.write(f"- {entry}\n")
+        context_entries: dict[str, list[str]] = {
+            "user_preferences": [],
+            "story_constraints": [],
+            "open_loops": [],
+        }
+        facts: list[MemoryFact] = []
+        for entry in clean_entries:
+            section, fact_kind = self._classify_long_term_entry(entry)
+            if section is not None:
+                context_entries[section].append(entry)
+                continue
+            facts.append(
+                MemoryFact(
+                    kind=fact_kind,
+                    content=entry,
+                    tags=self._infer_fact_tags(entry),
+                )
+            )
+        for section, section_entries in context_entries.items():
+            self.structured_memory.merge_context_entries(section=section, entries=section_entries)
+        self.structured_memory.append_facts(facts)
 
     def _dedupe_entries(self, entries: list[str], path: Path) -> list[str]:
         existing = self._read_bullet_entries(path)
@@ -156,22 +166,31 @@ class WorkspaceManager:
         return entries
 
     def build_memory_access_note(self) -> str:
-        targets = ["long_term", "daily_latest", "today", "yesterday"]
+        targets = [
+            "long_term",
+            "context:user_preferences",
+            "context:story_constraints",
+            "context:open_loops",
+            "daily_latest",
+            "today",
+            "yesterday",
+        ]
         recent_days = []
         today = date.today()
         for offset in range(self.config.daily_memory_lookback_days):
             target = today - timedelta(days=offset)
-            recent_days.append(f"daily:{target.isoformat()}")
+            recent_days.append(f"digest:{target.isoformat()}")
         if recent_days:
             targets.extend(recent_days)
         targets_text = ", ".join(targets)
         return (
             "# Memory Access\n\n"
-            "长期记忆和日记式记忆默认不会被完整注入上下文。\n"
+            "自动生成的结构化记忆与摘要默认不会被完整注入上下文。\n"
             "需要更完整的历史内容时可使用 memory_search 或 memory_get。\n"
             "memory_search 支持 lookup 与 recap 两种模式，会返回 snippet 或 summary_preview、target、source_path 等信息；如果结果不够，请把返回的 target 直接交给 memory_get。\n"
-            "memory_get 支持 long_term、daily_latest、today、yesterday、daily:YYYY-MM-DD，"
-            "也支持在其后附加 #L起始行-结束行，例如 daily:2026-03-26#L3-L12；"
+            "memory_get 支持 long_term、context:user_preferences、context:story_constraints、context:open_loops、"
+            "fact:MEMORY_ID、digest:YYYY-MM-DD，也兼容 daily_latest、today、yesterday、daily:YYYY-MM-DD；"
+            "也支持在其后附加 #L起始行-结束行，例如 digest:2026-03-26#L3-L12；"
             "session 检索结果也可以直接读取，例如 session:latest_compress、session:SESSION_ID:assistant:4、session_compact:SESSION_ID、session_compact:SESSION_ID#compression_history:0、session_compact:time_window:1-1#summary、content_ref:latest。"
             "memory_get 默认以 observe 模式读取内容；如果你明确要把全文直接交付给用户，可以显式传 delivery_mode=deliver。\n"
             f"当前常用 memory_get target: {targets_text}"
@@ -243,8 +262,7 @@ class WorkspaceManager:
     def memory_get(self, target: str) -> dict[str, str | int]:
         clean_target = target.strip()
         base_target, line_start, line_end = self._parse_memory_target(clean_target)
-        path, resolved_base = self._resolve_memory_target(base_target)
-        content = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+        content, source_path, resolved_base = self._resolve_memory_content(base_target)
         if line_start is not None and content:
             content = self._slice_lines(content, line_start=line_start, line_end=line_end or line_start)
         resolved_target = (
@@ -253,7 +271,7 @@ class WorkspaceManager:
         return {
             "target": clean_target,
             "resolved_target": resolved_target,
-            "source_path": str(path),
+            "source_path": source_path,
             "content": content,
             "line_start": line_start or 1,
             "line_end": line_end or line_start or max(len(content.splitlines()), 1),
@@ -268,23 +286,53 @@ class WorkspaceManager:
         line_end = int(match.group("end")) if match.group("end") else line_start
         return base_target, line_start, line_end
 
-    def _resolve_memory_target(self, base_target: str) -> tuple[Path, str]:
+    def _resolve_memory_content(self, base_target: str) -> tuple[str, str, str]:
         clean_target = base_target.strip()
         if clean_target == "long_term":
-            return self.root / "memory.md", "long_term"
+            path = self.root / "memory.md"
+            return path.read_text(encoding="utf-8").strip() if path.exists() else "", str(path), "long_term"
+        if clean_target.startswith("context:"):
+            section = clean_target.split(":", 1)[1].strip()
+            context = self.structured_memory.load_context()
+            allowed = {
+                "user_preferences": context.user_preferences,
+                "story_constraints": context.story_constraints,
+                "open_loops": context.open_loops,
+            }
+            if section not in allowed:
+                raise ValueError("unsupported_memory_target")
+            content = self._render_context_section(section, allowed[section])
+            return content, str(self.structured_memory.context_path()), clean_target
+        if clean_target.startswith("fact:"):
+            fact_id = clean_target.split(":", 1)[1].strip()
+            fact = self.structured_memory.get_fact(fact_id)
+            if fact is None:
+                return "", str(self.structured_memory.facts_path()), clean_target
+            content = "\n".join(
+                [
+                    f"id: {fact.id}",
+                    f"kind: {fact.kind}",
+                    f"content: {fact.content}",
+                    f"confidence: {fact.confidence:.2f}",
+                    f"date: {fact.date}",
+                    f"tags: {', '.join(fact.tags)}",
+                ]
+            ).strip()
+            return content, str(self.structured_memory.facts_path()), clean_target
         if clean_target in {"daily_latest", "today"}:
-            path = self.ensure_daily_file()
-            return path, f"daily:{path.stem}"
+            digest = self.structured_memory.latest_digest()
+            return self._render_digest_text(digest), str(self.structured_memory.digest_path(digest.date)), f"digest:{digest.date}"
         if clean_target == "yesterday":
-            path = self.ensure_daily_file(date.today() - timedelta(days=1))
-            return path, f"daily:{path.stem}"
+            digest = self.structured_memory.load_digest(date.today() - timedelta(days=1))
+            return self._render_digest_text(digest), str(self.structured_memory.digest_path(digest.date)), f"digest:{digest.date}"
         if clean_target.startswith("daily:"):
+            clean_target = f"digest:{clean_target.split(':', 1)[1]}"
+        if clean_target.startswith("digest:"):
             day_text = clean_target.split(":", 1)[1]
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_text):
                 raise ValueError("invalid_daily_target")
-            year, month, day = (int(item) for item in day_text.split("-"))
-            path = self.ensure_daily_file(date(year, month, day))
-            return path, clean_target
+            digest = self.structured_memory.load_digest(day_text)
+            return self._render_digest_text(digest), str(self.structured_memory.digest_path(day_text)), f"digest:{day_text}"
         raise ValueError("unsupported_memory_target")
 
     def _iter_memory_chunks(self) -> list[MemoryChunk]:
@@ -298,16 +346,70 @@ class WorkspaceManager:
         long_term = self.root / "memory.md"
         if long_term.exists():
             sources.append(("long_term", "long_term", "memory.md", long_term.read_text(encoding="utf-8").strip()))
-        for path in sorted(self.daily_root.glob("*.md"), reverse=True):
+        context = self.structured_memory.load_context()
+        for section, content in (
+            ("user_preferences", context.user_preferences),
+            ("story_constraints", context.story_constraints),
+            ("open_loops", context.open_loops),
+        ):
+            rendered = self._render_context_section(section, content)
+            if rendered.strip():
+                sources.append(
+                    (
+                        f"context:{section}",
+                        "structured_context",
+                        "runtime/structured_memory/context.json",
+                        rendered,
+                    )
+                )
+        for fact in self.structured_memory.list_facts():
             sources.append(
                 (
-                    f"daily:{path.stem}",
-                    "daily",
-                    str(Path("memory") / path.name),
-                    path.read_text(encoding="utf-8").strip(),
+                    f"fact:{fact.id}",
+                    fact.kind,
+                    "runtime/structured_memory/facts.jsonl",
+                    fact.content.strip(),
                 )
             )
         return sources
+
+    def _classify_long_term_entry(self, entry: str) -> tuple[str | None, str]:
+        clean = entry.strip()
+        if clean.startswith("用户偏好"):
+            return "user_preferences", "user_preference"
+        if any(keyword in clean for keyword in ("保留", "必须", "不要改", "不变")) and any(
+            keyword in clean for keyword in ("人物", "剧情", "设定", "世界观", "第一人称", "第三人称")
+        ):
+            return "story_constraints", "story_constraint"
+        if any(keyword in clean for keyword in ("待处理", "待确认", "未解决", "open loop", "后续", "下一步")):
+            return "open_loops", "open_loop"
+        if any(keyword in clean for keyword in ("世界观", "设定")):
+            return None, "world_rule"
+        if any(keyword in clean for keyword in ("人物", "剧情")):
+            return None, "story_fact"
+        return None, "memory_fact"
+
+    def _infer_fact_tags(self, entry: str) -> list[str]:
+        tags: list[str] = []
+        for keyword in ("人物", "剧情", "设定", "世界观", "第一人称", "第三人称"):
+            if keyword in entry and keyword not in tags:
+                tags.append(keyword)
+        return tags
+
+    def _render_context_section(self, section: str, entries: list[str]) -> str:
+        heading = {
+            "user_preferences": "User Preferences",
+            "story_constraints": "Story Constraints",
+            "open_loops": "Open Loops",
+        }.get(section, section)
+        if not entries:
+            return ""
+        return "\n".join([f"# {heading}", "", *[f"- {item}" for item in entries]]).strip()
+
+    def _render_digest_text(self, digest: MemoryDigest) -> str:
+        lines = [f"# Memory Digest - {digest.date}", ""]
+        lines.extend(f"- {item}" for item in digest.lines)
+        return "\n".join(lines).strip()
 
     def _chunk_memory_text(
         self,

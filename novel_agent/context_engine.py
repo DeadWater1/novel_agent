@@ -18,6 +18,8 @@ class ContextEngineDependencies:
     config: AgentConfig
     workspace: WorkspaceManager
     decision_backend: Any
+    tool_prompt_docs: str = ""
+    tool_names: tuple[str, ...] = ()
     session_store: SessionStore | None = None
     meta_store: SessionMetaStore | None = None
     compaction_manager: ContextCompactionManager | None = None
@@ -179,6 +181,8 @@ class ContextEngine:
                     estimator(
                         messages=messages,
                         workspace_docs=workspace_docs,
+                        tool_prompt_docs=self.deps.tool_prompt_docs,
+                        tool_names=self.deps.tool_names,
                         session_summary=session_summary,
                         compacted_session_context=compacted_session_context,
                         recent_content_references=recent_content_references,

@@ -14,7 +14,7 @@ class PlanStep(BaseModel):
     step_index: int = 1
     goal: str = ""
     preferred_action: Literal["direct_reply", "call_tool"] = "direct_reply"
-    preferred_tool: Literal["compress_chapter", "memory_search", "memory_get", "embedding_similarity"] | None = None
+    preferred_tool: str | None = None
 
     @model_validator(mode="after")
     def _normalize_step_index(self) -> "PlanStep":
@@ -41,6 +41,8 @@ class DecisionOutput(BaseModel):
     action: Literal["direct_reply", "call_tool", "reject"]
     assistant_reply: str = ""
     step_index: int = 1
+    needs_review: bool = False
+    review_reason: str = ""
     tool_name: str | None = None
     tool_args: dict[str, Any] = Field(default_factory=dict)
     plan_update: ExecutionPlanOutput | None = None

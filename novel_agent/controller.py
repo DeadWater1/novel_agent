@@ -15,19 +15,16 @@ from .memory import SessionState, SessionStore
 from .registry import ToolRegistry
 from .schemas import (
     AgentTurnResult,
-    CompressionRequest,
     ContextReport,
     DecisionOutput,
     DecisionReviewOutput,
-    EmbeddingSimilarityArgs,
     ExecutionPlanOutput,
-    MemoryGetArgs,
-    MemorySearchArgs,
     MemoryWrite,
     PlanStep,
     RecentContentReference,
     TimeScope,
 )
+from .toolbox import ToolExecutionResult, ToolRuntimeContext
 from .search_utils import extract_snippet, hybrid_search_score, hybrid_search_scores, mmr_rerank
 from .session_meta import SessionMetaStore
 from .workspace import WorkspaceManager
@@ -49,18 +46,6 @@ class ControllerDependencies:
     meta_store: SessionMetaStore | None = None
     compaction_manager: ContextCompactionManager | None = None
 
-
-@dataclass(slots=True)
-class ToolExecutionResult:
-    tool_name: str
-    observation_text: str
-    payload: dict[str, Any]
-    tool_trace: dict[str, Any]
-    terminal: bool = False
-    final_reply: str = ""
-    thinking: str = ""
-
-
 @dataclass(slots=True)
 class TurnPlanState:
     plan: ExecutionPlanOutput
@@ -76,11 +61,15 @@ class TurnPlanState:
 class NovelAgentController:
     def __init__(self, deps: ControllerDependencies) -> None:
         self.deps = deps
+        self.tool_prompt_docs = deps.registry.render_prompt_docs()
+        self.tool_names = deps.registry.names()
         self.context_engine = ContextEngine(
             ContextEngineDependencies(
                 config=deps.config,
                 workspace=deps.workspace,
                 decision_backend=deps.decision_backend,
+                tool_prompt_docs=self.tool_prompt_docs,
+                tool_names=self.tool_names,
                 session_store=deps.session_store,
                 meta_store=deps.meta_store,
                 compaction_manager=deps.compaction_manager,
@@ -111,6 +100,8 @@ class NovelAgentController:
                 user_text=user_text,
                 messages=planning_context.messages,
                 workspace_docs=planning_context.workspace_docs,
+                tool_prompt_docs=self.tool_prompt_docs,
+                tool_names=self.tool_names,
                 session_summary=planning_context.session_summary,
                 compacted_session_context=planning_context.compacted_session_context,
                 recent_content_references=planning_context.recent_content_references,
@@ -156,6 +147,19 @@ class NovelAgentController:
         for loop_step_index in range(1, self.deps.config.agent_max_loop_steps + 1):
             current_plan_step = self._current_plan_step(plan_state)
             if current_plan_step is None:
+                if used_tool:
+                    return self._run_final_synthesis(
+                        session=session,
+                        user_text=user_text,
+                        turn_index=turn_index,
+                        plan_state=plan_state,
+                        transcript_events=transcript_events,
+                        loop_events=loop_events,
+                        tool_steps=tool_steps,
+                        aggregated_memory=aggregated_memory,
+                        context_report=context_report,
+                        review_passes=review_passes,
+                    )
                 return self._finalize_error(
                     session,
                     "当前请求暂时无法处理",
@@ -178,6 +182,8 @@ class NovelAgentController:
                 decision = self.deps.decision_backend.decide(
                     messages=context_bundle.messages,
                     workspace_docs=context_bundle.workspace_docs,
+                    tool_prompt_docs=self.tool_prompt_docs,
+                    tool_names=self.tool_names,
                     session_summary=context_bundle.session_summary,
                     compacted_session_context=context_bundle.compacted_session_context,
                     recent_content_references=context_bundle.recent_content_references,
@@ -251,8 +257,33 @@ class NovelAgentController:
                     context_report=context_report,
                 )
 
+            has_remaining_steps = self._has_remaining_plan_steps(plan_state)
+
             if decision.action == "direct_reply":
-                if self._should_review_direct_reply(review_passes=review_passes):
+                if has_remaining_steps:
+                    blocked_payload = {
+                        "reason": "plan_has_remaining_steps",
+                        "current_step_index": current_plan_step.step_index,
+                        "current_step_goal": current_plan_step.goal,
+                        "remaining_step_count": len(plan_state.plan.steps) - plan_state.current_position - 1,
+                    }
+                    transcript_events.append(
+                        self._event(
+                            turn_index,
+                            "premature_direct_reply_blocked",
+                            step_index=loop_step_index,
+                            payload=blocked_payload,
+                        )
+                    )
+                    loop_events.append(
+                        {
+                            "step_index": loop_step_index,
+                            "event_type": "premature_direct_reply_blocked",
+                            **blocked_payload,
+                        }
+                    )
+                    continue
+                if self._should_review_direct_reply(decision=decision, review_passes=review_passes):
                     review = self._review_direct_reply(
                         user_text=user_text,
                         decision=decision,
@@ -337,6 +368,8 @@ class NovelAgentController:
                 tool_steps=tool_steps,
                 aggregated_memory=aggregated_memory,
                 context_report=context_report,
+                allow_terminal_finish=not has_remaining_steps,
+                loop_events=loop_events,
             )
             if result is not None:
                 completed_event = self._plan_step_completed_event(turn_index, current_plan_step)
@@ -375,6 +408,19 @@ class NovelAgentController:
                     "goal": current_plan_step.goal,
                 }
             )
+            if plan_state.current_position >= len(plan_state.plan.steps):
+                return self._run_final_synthesis(
+                    session=session,
+                    user_text=user_text,
+                    turn_index=turn_index,
+                    plan_state=plan_state,
+                    transcript_events=transcript_events,
+                    loop_events=loop_events,
+                    tool_steps=tool_steps,
+                    aggregated_memory=aggregated_memory,
+                    context_report=context_report,
+                    review_passes=review_passes,
+                )
 
         return self._finalize_error(
             session,
@@ -395,6 +441,8 @@ class NovelAgentController:
         tool_steps: list[dict[str, Any]],
         aggregated_memory: MemoryWrite,
         context_report: ContextReport,
+        allow_terminal_finish: bool,
+        loop_events: list[dict[str, Any]],
     ) -> AgentTurnResult | None:
         tool_name = decision.tool_name
         if not self.deps.registry.is_registered(tool_name):
@@ -435,6 +483,20 @@ class NovelAgentController:
 
         try:
             execution = self._execute_tool(session, tool_name, dict(decision.tool_args))
+        except ValidationError as exc:
+            return self._finalize_error(
+                session,
+                "当前请求暂时无法处理",
+                decision=decision.model_dump(),
+                transcript_events=transcript_events,
+                tool_trace={
+                    "steps": tool_steps,
+                    "requested_tool": tool_name,
+                    "status": "invalid_args",
+                    "detail": str(exc),
+                },
+                context_report=context_report,
+            )
         except Exception as exc:
             return self._finalize_error(
                 session,
@@ -450,6 +512,8 @@ class NovelAgentController:
                 "status": execution.tool_trace.get("status", "ok"),
                 "tool_args": dict(decision.tool_args),
                 "observation": execution.observation_text,
+                "payload": execution.payload,
+                "tool_trace": execution.tool_trace,
             }
         )
         transcript_events.append(
@@ -465,6 +529,28 @@ class NovelAgentController:
         )
 
         if execution.terminal:
+            if not allow_terminal_finish:
+                deferred_payload = {
+                    "tool_name": execution.tool_name,
+                    "reason": "plan_has_remaining_steps",
+                }
+                transcript_events.append(
+                    self._event(
+                        turn_index,
+                        "terminal_tool_deferred",
+                        step_index=step_index,
+                        tool_name=execution.tool_name,
+                        payload=deferred_payload,
+                    )
+                )
+                loop_events.append(
+                    {
+                        "step_index": step_index,
+                        "event_type": "terminal_tool_deferred",
+                        **deferred_payload,
+                    }
+                )
+                return None
             return self._finalize_success(
                 session=session,
                 reply=execution.final_reply.strip() or "当前请求暂时无法处理",
@@ -480,126 +566,41 @@ class NovelAgentController:
         return None
 
     def _execute_tool(self, session: SessionState, tool_name: str, tool_args: dict[str, Any]) -> ToolExecutionResult:
-        if tool_name == "compress_chapter":
-            request = CompressionRequest(
-                raw_text=str(tool_args["raw_text"]),
-                max_new_tokens=self.deps.config.compression_max_new_tokens,
-                temperature=self.deps.config.compression_temperature,
-                seed=self.deps.config.compression_seed,
-                top_p=self.deps.config.compression_top_p,
-                top_k=self.deps.config.compression_top_k,
-                enable_thinking=self.deps.config.compression_enable_thinking,
-            )
-            tool_result = self.deps.compression_backend.compress(request)
-            return ToolExecutionResult(
-                tool_name=tool_name,
-                observation_text=tool_result.compressed_text.strip(),
-                payload={"compressed_text": tool_result.compressed_text.strip()},
-                tool_trace={"requested_tool": tool_name, "status": "ok", "tool_args": request.model_dump()},
-                terminal=True,
-                final_reply=tool_result.compressed_text.strip(),
-                thinking=tool_result.thinking,
-            )
+        handler = self.deps.registry.get_handler(tool_name)
+        if handler is None:
+            raise ValueError("unsupported_tool")
+        parsed_args = handler.parse_args(tool_args)
+        return handler.execute(session, parsed_args, self._tool_runtime())
 
-        if tool_name == "memory_search":
-            search_args = MemorySearchArgs.model_validate(tool_args)
-            max_results = int(search_args.max_results or self.deps.config.memory_search_max_results)
-            results = self._search_memory_sources(
-                session=session,
-                query=search_args.query.strip(),
-                max_results=max_results,
-                search_mode=search_args.search_mode,
-                scope=search_args.scope,
-                time_scope=search_args.time_scope,
-            )
-            if results:
-                observation = self._format_memory_search_results(results, search_mode=search_args.search_mode)
-            else:
-                observation = "memory_search 未找到相关记忆。"
-            return ToolExecutionResult(
-                tool_name=tool_name,
-                observation_text=self._truncate_memory_text(observation),
-                payload={"search_args": search_args.model_dump(), "results": results},
-                tool_trace={
-                    "requested_tool": tool_name,
-                    "status": "ok",
-                    "result_count": len(results),
-                    "query": search_args.query,
-                    "search_mode": search_args.search_mode,
-                    "scope": search_args.scope,
-                },
-                terminal=False,
-            )
+    def _tool_runtime(self) -> ToolRuntimeContext:
+        return ToolRuntimeContext(
+            config=self.deps.config,
+            workspace=self.deps.workspace,
+            compression_backend=self.deps.compression_backend,
+            embedding_backend=self.deps.embedding_backend,
+            embedding_index_manager=self.deps.embedding_index_manager,
+            session_store=self.deps.session_store,
+            meta_store=self.deps.meta_store,
+            compaction_manager=self.deps.compaction_manager,
+            search_memory_sources=self._search_memory_sources,
+            format_memory_search_results=self._format_memory_search_results,
+            memory_get=self._memory_get,
+            remember_recent_content_reference=self._remember_recent_content_reference,
+            truncate_memory_text=self._truncate_memory_text,
+            memory_observation_preview=self._memory_observation_preview,
+        )
 
-        if tool_name == "memory_get":
-            memory_args = MemoryGetArgs.model_validate(tool_args)
-            memory_doc = self._memory_get(session, target=memory_args.target)
-            content = str(memory_doc.get("content") or "").strip()
-            resolved_target = str(memory_doc.get("resolved_target") or memory_doc["target"])
-            source_path = str(memory_doc.get("source_path") or "")
-            observation_preview = self._memory_observation_preview(content or "(empty)")
-            observation = (
-                f"target={resolved_target} source={source_path or '(empty)'} length={len(content)}\n"
-                f"preview:\n{observation_preview}"
-            )
-            self._remember_recent_content_reference(session, memory_doc)
-            return ToolExecutionResult(
-                tool_name=tool_name,
-                observation_text=observation,
-                payload={**memory_doc, "delivery_mode": memory_args.delivery_mode},
-                tool_trace={
-                    "requested_tool": tool_name,
-                    "status": "ok",
-                    "target": memory_args.target,
-                    "resolved_target": resolved_target,
-                    "delivery_mode": memory_args.delivery_mode,
-                },
-                terminal=memory_args.delivery_mode == "deliver",
-                final_reply=(content or "未找到对应内容。") if memory_args.delivery_mode == "deliver" else "",
-            )
-
-        if tool_name == "embedding_similarity":
-            similarity_args = EmbeddingSimilarityArgs.model_validate(tool_args)
-            candidates = [similarity_args.text] if similarity_args.text else list(similarity_args.texts)
-            scores = self.deps.embedding_backend.similarity_batch(similarity_args.query, candidates)
-            ranked = [
-                {
-                    "index": index + 1,
-                    "score": float(score),
-                    "text": text,
-                    "preview": extract_snippet(text, similarity_args.query, max_chars=220),
-                }
-                for index, (text, score) in enumerate(zip(candidates, scores))
-            ]
-            ranked.sort(key=lambda item: item["score"], reverse=True)
-            if similarity_args.top_k is not None:
-                ranked = ranked[: similarity_args.top_k]
-            observation_lines = [
-                f"{index}. score={item['score']:.4f} length={len(item['text'])}\npreview: {item['preview']}"
-                for index, item in enumerate(ranked, start=1)
-            ]
-            observation = "\n".join(observation_lines) if observation_lines else "embedding_similarity 无可比较文本。"
-            return ToolExecutionResult(
-                tool_name=tool_name,
-                observation_text=self._truncate_memory_text(observation),
-                payload={
-                    "query": similarity_args.query,
-                    "items": ranked,
-                },
-                tool_trace={
-                    "requested_tool": tool_name,
-                    "status": "ok",
-                    "candidate_count": len(candidates),
-                },
-                terminal=False,
-            )
-
-        raise ValueError("unsupported_tool")
-
-    def _should_review_direct_reply(self, *, review_passes: int) -> bool:
+    def _should_review_direct_reply(self, *, decision: DecisionOutput, review_passes: int) -> bool:
         if not self.deps.config.decision_reflection_enabled:
             return False
-        return review_passes < max(self.deps.config.decision_reflection_max_passes, 0)
+        if review_passes >= max(self.deps.config.decision_reflection_max_passes, 0):
+            return False
+        mode = str(getattr(self.deps.config, "decision_review_mode", "risk_gated") or "risk_gated").strip().lower()
+        if mode == "disabled":
+            return False
+        if mode == "always":
+            return True
+        return bool(decision.needs_review)
 
     def _review_direct_reply(
         self,
@@ -642,6 +643,297 @@ class NovelAgentController:
         if plan_state.current_position >= len(plan_state.plan.steps):
             return None
         return plan_state.plan.steps[plan_state.current_position]
+
+    def _has_remaining_plan_steps(self, plan_state: TurnPlanState) -> bool:
+        return plan_state.current_position < len(plan_state.plan.steps) - 1
+
+    def _run_final_synthesis(
+        self,
+        *,
+        session: SessionState,
+        user_text: str,
+        turn_index: int,
+        plan_state: TurnPlanState,
+        transcript_events: list[dict[str, Any]],
+        loop_events: list[dict[str, Any]],
+        tool_steps: list[dict[str, Any]],
+        aggregated_memory: MemoryWrite,
+        context_report: ContextReport,
+        review_passes: int,
+    ) -> AgentTurnResult:
+        synthesis_step = PlanStep(
+            step_index=len(plan_state.plan.steps) + 1,
+            goal="基于已有工具证据输出最终回复",
+            preferred_action="direct_reply",
+            preferred_tool=None,
+        )
+        evidence_payload = self._build_final_synthesis_evidence(tool_steps)
+        active_loop_events = list(loop_events)
+        active_loop_events.append(
+            {
+                "step_index": synthesis_step.step_index,
+                "event_type": "final_synthesis_started",
+                "reason": "plan_exhausted_after_tool_steps",
+            }
+        )
+        active_loop_events.append(
+            {
+                "step_index": synthesis_step.step_index,
+                "event_type": "final_synthesis_evidence",
+                "payload": evidence_payload,
+            }
+        )
+        transcript_events.append(
+            self._event(
+                turn_index,
+                "final_synthesis_started",
+                step_index=synthesis_step.step_index,
+                payload={"reason": "plan_exhausted_after_tool_steps"},
+            )
+        )
+        transcript_events.append(
+            self._event(
+                turn_index,
+                "final_synthesis_evidence",
+                step_index=synthesis_step.step_index,
+                payload=evidence_payload,
+            )
+        )
+
+        local_review_passes = review_passes
+        last_invalid_reason = "final_synthesis_invalid_output"
+        for attempt in range(1, 3):
+            if attempt > 1:
+                retry_payload = {"attempt": attempt, "reason": last_invalid_reason}
+                active_loop_events.append(
+                    {
+                        "step_index": synthesis_step.step_index,
+                        "event_type": "final_synthesis_retry",
+                        **retry_payload,
+                    }
+                )
+                transcript_events.append(
+                    self._event(
+                        turn_index,
+                        "final_synthesis_retry",
+                        step_index=synthesis_step.step_index,
+                        payload=retry_payload,
+                    )
+                )
+
+            context_bundle = self.context_engine.build_turn_context(
+                session=session,
+                user_text=user_text,
+                loop_events=active_loop_events,
+                execution_plan=plan_state.plan.model_dump(),
+                current_step=synthesis_step.model_dump(),
+                completed_steps=[step.model_dump() for step in plan_state.completed_steps or []],
+            )
+            context_report = self._merge_context_report(context_report, context_bundle.context_report)
+
+            try:
+                decision = self.deps.decision_backend.decide(
+                    messages=context_bundle.messages,
+                    workspace_docs=context_bundle.workspace_docs,
+                    tool_prompt_docs=self.tool_prompt_docs,
+                    tool_names=self.tool_names,
+                    session_summary=context_bundle.session_summary,
+                    compacted_session_context=context_bundle.compacted_session_context,
+                    recent_content_references=context_bundle.recent_content_references,
+                    loop_events=context_bundle.loop_events,
+                    execution_plan=plan_state.plan.model_dump(),
+                    current_step=synthesis_step.model_dump(),
+                    completed_steps=[step.model_dump() for step in plan_state.completed_steps or []],
+                )
+            except ValidationError as exc:
+                if attempt == 1:
+                    last_invalid_reason = f"decision_validation:{exc}"
+                    continue
+                return self._finalize_error(
+                    session,
+                    f"决策结果校验失败: {exc}",
+                    transcript_events=transcript_events,
+                    context_report=context_report,
+                    tool_trace={"steps": tool_steps, "status": "final_synthesis_failed"},
+                )
+            except Exception as exc:
+                return self._finalize_error(
+                    session,
+                    f"决策后端不可用: {exc}",
+                    transcript_events=transcript_events,
+                    context_report=context_report,
+                    tool_trace={"steps": tool_steps, "status": "final_synthesis_failed"},
+                )
+
+            if not isinstance(decision, DecisionOutput):
+                try:
+                    decision = DecisionOutput.model_validate(decision)
+                except ValidationError as exc:
+                    if attempt == 1:
+                        last_invalid_reason = f"decision_validation:{exc}"
+                        continue
+                    return self._finalize_error(
+                        session,
+                        f"决策结果校验失败: {exc}",
+                        transcript_events=transcript_events,
+                        context_report=context_report,
+                        tool_trace={"steps": tool_steps, "status": "final_synthesis_failed"},
+                    )
+
+            transcript_events.append(self._decision_event(turn_index, synthesis_step.step_index, decision))
+            self._merge_memory_write(aggregated_memory, decision.memory_write)
+
+            reply = decision.assistant_reply.strip()
+            if decision.domain == "novel" and decision.action == "direct_reply" and reply:
+                if self._should_review_direct_reply(decision=decision, review_passes=local_review_passes):
+                    review = self._review_direct_reply(
+                        user_text=user_text,
+                        decision=decision,
+                        context_bundle=context_bundle,
+                        plan_state=plan_state,
+                        current_step=synthesis_step,
+                    )
+                    context_report.review_triggered = True
+                    context_report.review_verdict = review.verdict
+                    context_report.review_reason = review.reason
+                    transcript_events.append(
+                        self._event(
+                            turn_index,
+                            "decision_review",
+                            step_index=synthesis_step.step_index,
+                            payload=review.model_dump(),
+                        )
+                    )
+                    if review.verdict == "retry":
+                        local_review_passes += 1
+                        last_invalid_reason = f"review_retry:{review.reason}"
+                        if attempt == 1:
+                            active_loop_events.append(
+                                {
+                                    "step_index": synthesis_step.step_index,
+                                    "event_type": "decision_review",
+                                    "verdict": review.verdict,
+                                    "reason": review.reason,
+                                }
+                            )
+                            continue
+                        break
+                transcript_events.append(
+                    self._event(
+                        turn_index,
+                        "final_synthesis_completed",
+                        step_index=synthesis_step.step_index,
+                        payload={"attempt": attempt},
+                    )
+                )
+                return self._finalize_success(
+                    session=session,
+                    reply=reply,
+                    domain="novel",
+                    action="call_tool",
+                    decision=decision.model_dump(),
+                    transcript_events=transcript_events,
+                    memory_write=aggregated_memory,
+                    tool_trace={"steps": tool_steps, "status": "final_synthesis_completed"},
+                    context_report=context_report,
+                )
+
+            if decision.domain == "out_of_scope":
+                last_invalid_reason = "final_synthesis_out_of_scope"
+            elif decision.action == "reject":
+                last_invalid_reason = "final_synthesis_reject"
+            elif decision.action == "call_tool":
+                last_invalid_reason = "final_synthesis_requested_tool"
+            else:
+                last_invalid_reason = "final_synthesis_empty_direct_reply"
+
+        transcript_events.append(
+            self._event(
+                turn_index,
+                "final_synthesis_failed",
+                step_index=synthesis_step.step_index,
+                payload={"reason": last_invalid_reason},
+            )
+        )
+        return self._finalize_error(
+            session,
+            "当前请求暂时无法处理",
+            transcript_events=transcript_events,
+            context_report=context_report,
+            tool_trace={"steps": tool_steps, "status": "final_synthesis_failed", "detail": last_invalid_reason},
+        )
+
+    def _build_final_synthesis_evidence(self, tool_steps: list[dict[str, Any]]) -> dict[str, Any]:
+        evidence_items: list[dict[str, Any]] = []
+        for step in tool_steps[-4:]:
+            tool_name = str(step.get("requested_tool") or "")
+            payload = step.get("payload") or {}
+            if tool_name == "memory_get":
+                content = str(payload.get("content") or "")
+                evidence_items.append(
+                    {
+                        "tool_name": tool_name,
+                        "target": step.get("tool_args", {}).get("target", ""),
+                        "resolved_target": payload.get("resolved_target", ""),
+                        "source_path": payload.get("source_path", ""),
+                        "content_length": len(content),
+                        "preview": self._memory_observation_preview(content),
+                    }
+                )
+                continue
+            if tool_name == "memory_search":
+                results = list(payload.get("results") or [])[:3]
+                evidence_items.append(
+                    {
+                        "tool_name": tool_name,
+                        "query": payload.get("search_args", {}).get("query", ""),
+                        "results": [
+                            {
+                                "target": item.get("target", ""),
+                                "score": round(float(item.get("score", 0.0)), 4),
+                                "snippet": self._truncate_memory_text(
+                                    str(item.get("snippet") or item.get("summary_preview") or "")
+                                ),
+                            }
+                            for item in results
+                        ],
+                    }
+                )
+                continue
+            if tool_name == "embedding_similarity":
+                items = list(payload.get("items") or [])[:3]
+                evidence_items.append(
+                    {
+                        "tool_name": tool_name,
+                        "query": self._truncate_memory_text(str(payload.get("query") or "")),
+                        "candidate_count": payload.get("candidate_count", len(payload.get("items") or [])),
+                        "top_score": payload.get("top_score", 0.0),
+                        "best_match_index": payload.get("best_match_index"),
+                        "exact_match_indexes": payload.get("exact_match_indexes", []),
+                        "exact_match_all": bool(payload.get("exact_match_all", False)),
+                        "items": [
+                            {
+                                "index": item.get("index"),
+                                "score": round(float(item.get("score", 0.0)), 4),
+                                "preview": self._truncate_memory_text(str(item.get("preview") or "")),
+                            }
+                            for item in items
+                        ],
+                    }
+                )
+                continue
+            evidence_items.append(
+                {
+                    "tool_name": tool_name,
+                    "status": step.get("status", "ok"),
+                    "observation": self._truncate_memory_text(str(step.get("observation") or "")),
+                }
+            )
+
+        return {
+            "tool_count": len(tool_steps),
+            "evidence_items": evidence_items,
+        }
 
     def _compaction_manager(self) -> ContextCompactionManager | None:
         return self.deps.compaction_manager

@@ -156,12 +156,14 @@ class LocalDecisionBackend(BaseBackend):
         messages: list[dict[str, str]],
         workspace_docs: str,
         session_summary: str,
+        tool_prompt_docs: str = "",
+        tool_names: tuple[str, ...] = (),
         compacted_session_context: str = "",
         recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
     ) -> ExecutionPlanOutput:
         payload, _, output_text = self._generate_json_payload(
-            system_prompt=build_plan_system_prompt(workspace_docs),
+            system_prompt=build_plan_system_prompt(workspace_docs, tool_prompt_docs, tool_names),
             user_content=(
                 "请先为当前用户问题生成一个显式执行计划 JSON。\n\n"
                 f"User Message:\n{user_text}\n\n"
@@ -180,6 +182,8 @@ class LocalDecisionBackend(BaseBackend):
         messages: list[dict[str, str]],
         workspace_docs: str,
         session_summary: str,
+        tool_prompt_docs: str = "",
+        tool_names: tuple[str, ...] = (),
         compacted_session_context: str = "",
         recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
@@ -188,7 +192,7 @@ class LocalDecisionBackend(BaseBackend):
         completed_steps: list[dict[str, Any]] | None = None,
     ) -> DecisionOutput:
         payload, thinking, output_text = self._generate_json_payload(
-            system_prompt=build_decision_system_prompt(workspace_docs),
+            system_prompt=build_decision_system_prompt(workspace_docs, tool_prompt_docs, tool_names),
             user_content=(
                 "请根据以下对话和会话摘要输出决策 JSON。\n\n"
                 f"Execution Plan:\n{json.dumps(execution_plan or {}, ensure_ascii=False)}\n\n"
@@ -246,6 +250,8 @@ class LocalDecisionBackend(BaseBackend):
         messages: list[dict[str, str]],
         workspace_docs: str,
         session_summary: str,
+        tool_prompt_docs: str = "",
+        tool_names: tuple[str, ...] = (),
         compacted_session_context: str = "",
         recent_content_references: str = "",
         loop_events: list[dict[str, Any]] | None = None,
@@ -256,7 +262,7 @@ class LocalDecisionBackend(BaseBackend):
         self._ensure_loaded(load_model=False)
         assert self._tokenizer is not None
 
-        system_prompt = build_decision_system_prompt(workspace_docs)
+        system_prompt = build_decision_system_prompt(workspace_docs, tool_prompt_docs, tool_names)
         request_messages = [
             {"role": "system", "content": system_prompt},
             {
